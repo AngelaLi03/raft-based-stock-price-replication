@@ -9,6 +9,7 @@ from typing import List, Optional, Dict, Any
 from .types import RaftState, PeerInfo, LogEntry
 from .storage import RaftStorage
 from .election import ElectionManager
+from kv.state_machine import KVStateMachine, serialize_put_command, serialize_batch_put_command
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ class RaftNode:
         # Initialize storage
         self.storage = RaftStorage(data_dir, node_id)
         
+        # Initialize KV state machine
+        self.kv_state_machine = KVStateMachine(data_dir)
+        
         # Initialize election manager
         self.election_manager = ElectionManager(
             node_id=node_id,
@@ -46,6 +50,10 @@ class RaftNode:
         self.commit_index = 0
         self.last_applied = 0
         
+        # Leader state for replication
+        self.next_index: Dict[str, int] = {}
+        self.match_index: Dict[str, int] = {}
+        
         # gRPC server references (set by server)
         self.raft_server = None
         self.client_server = None
@@ -59,6 +67,14 @@ class RaftNode:
         # Load persistent state
         self.election_manager.current_term = self.storage.get_current_term()
         self.election_manager.voted_for = self.storage.get_voted_for()
+        self.commit_index = self.storage.get_commit_index()
+        self.last_applied = self.commit_index
+        
+        # Start KV state machine
+        await self.kv_state_machine.start()
+        
+        # Apply any unapplied committed entries
+        await self._apply_committed_entries()
         
         # Start as follower with election timeout
         self.election_manager.start_election_timeout()
@@ -72,6 +88,9 @@ class RaftNode:
         # Stop election timeout and heartbeats
         self.election_manager.stop_election_timeout()
         self.election_manager.stop_heartbeat()
+        
+        # Stop KV state machine
+        await self.kv_state_machine.stop()
         
         logger.info(f"Raft node {self.node_id} stopped")
     
@@ -169,12 +188,139 @@ class RaftNode:
     async def _on_become_leader(self) -> None:
         """Called when this node becomes leader."""
         self.state = RaftState.LEADER
+        
+        # Initialize leader state
+        next_log_index = self.storage.get_last_log_index() + 1
+        for peer in self.peers:
+            self.next_index[peer.node_id] = next_log_index
+            self.match_index[peer.node_id] = 0
+        
+        # Start heartbeat task
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        
         logger.info(f"Node {self.node_id} became leader for term {self.election_manager.current_term}")
     
     async def _on_become_follower(self) -> None:
         """Called when this node becomes follower."""
         self.state = RaftState.FOLLOWER
+        
+        # Stop heartbeat task
+        if hasattr(self, 'heartbeat_task') and self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        
         logger.info(f"Node {self.node_id} became follower")
+    
+    async def _apply_committed_entries(self) -> None:
+        """Apply all committed entries that haven't been applied yet."""
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            entry = self.storage.get_log_entry(self.last_applied)
+            if entry:
+                await self.kv_state_machine.apply_command(entry)
+                logger.debug(f"Applied entry {self.last_applied} to state machine")
+    
+    async def _replicate_to_peers(self, entries: List[LogEntry]) -> bool:
+        """
+        Replicate entries to all peers and wait for majority acknowledgment.
+        
+        Args:
+            entries: List of log entries to replicate
+            
+        Returns:
+            True if replicated to majority, False otherwise
+        """
+        if not entries:
+            return True
+        
+        # Send AppendEntries to all peers
+        replication_tasks = []
+        for peer in self.peers:
+            task = asyncio.create_task(self._send_append_entries_to_peer(peer, entries))
+            replication_tasks.append(task)
+        
+        # Wait for all replication attempts
+        results = await asyncio.gather(*replication_tasks, return_exceptions=True)
+        
+        # Count successful replications
+        successful_replications = 1  # Count self
+        for result in results:
+            if isinstance(result, dict) and result.get("success", False):
+                successful_replications += 1
+        
+        # Check if we have majority
+        majority = (len(self.peers) + 1) // 2 + 1  # +1 for self
+        return successful_replications >= majority
+    
+    async def _send_append_entries_to_peer(self, peer: PeerInfo, entries: List[LogEntry]) -> Dict[str, Any]:
+        """
+        Send AppendEntries to a specific peer.
+        
+        Args:
+            peer: Peer to send to
+            entries: Log entries to send
+            
+        Returns:
+            Result dictionary with success status
+        """
+        try:
+            # Get previous log entry info
+            prev_log_index = self.next_index[peer.node_id] - 1
+            prev_log_term = 0
+            if prev_log_index > 0:
+                prev_entry = self.storage.get_log_entry(prev_log_index)
+                if prev_entry:
+                    prev_log_term = prev_entry.term
+            
+            # Send AppendEntries RPC
+            response = await self._append_entries_to_peer(
+                peer.node_id, peer, 
+                self.election_manager.current_term,
+                prev_log_index, prev_log_term,
+                entries, self.commit_index
+            )
+            
+            if response and response.success:
+                # Update next_index and match_index
+                self.next_index[peer.node_id] = len(entries) + self.next_index[peer.node_id]
+                self.match_index[peer.node_id] = self.next_index[peer.node_id] - 1
+                return {"success": True, "match_index": response.match_index}
+            else:
+                # Decrement next_index for retry
+                if self.next_index[peer.node_id] > 1:
+                    self.next_index[peer.node_id] -= 1
+                return {"success": False}
+                
+        except Exception as e:
+            logger.warning(f"Failed to replicate to {peer.node_id}: {e}")
+            return {"success": False}
+    
+    async def _update_commit_index(self) -> None:
+        """Update commit index based on match_index from followers."""
+        if self.state != RaftState.LEADER:
+            return
+        
+        # Find the highest index that's replicated on majority
+        match_indices = [self.storage.get_last_log_index()]  # Include self
+        for peer in self.peers:
+            match_indices.append(self.match_index[peer.node_id])
+        
+        match_indices.sort(reverse=True)
+        majority_index = match_indices[(len(self.peers) + 1) // 2]
+        
+        # Only commit entries from current term
+        if majority_index > self.commit_index:
+            entry = self.storage.get_log_entry(majority_index)
+            if entry and entry.term == self.election_manager.current_term:
+                self.commit_index = majority_index
+                self.storage.set_commit_index(self.commit_index)
+                logger.info(f"Updated commit index to {self.commit_index}")
+                
+                # Apply newly committed entries
+                await self._apply_committed_entries()
     
     # gRPC service methods (called by server)
     
@@ -211,6 +357,34 @@ class RaftNode:
         
         logger.debug(f"Handling append entries from {request.leader_id}")
         
+        # Check term
+        if request.term < self.election_manager.current_term:
+            response = raft_pb2.AppendEntriesResponse(
+                term=self.election_manager.current_term,
+                success=False,
+                match_index=0
+            )
+            return response
+        
+        # Update term and become follower if needed
+        if request.term > self.election_manager.current_term:
+            self.election_manager.current_term = request.term
+            self.election_manager.voted_for = None
+            if self.state != RaftState.FOLLOWER:
+                await self._on_become_follower()
+        
+        # Reset election timeout
+        self.election_manager.start_election_timeout()
+        
+        # Check log matching property
+        if not self._check_log_matching(request.prev_log_index, request.prev_log_term):
+            response = raft_pb2.AppendEntriesResponse(
+                term=self.election_manager.current_term,
+                success=False,
+                match_index=0
+            )
+            return response
+        
         # Convert protobuf entries to LogEntry objects
         entries = []
         for pb_entry in request.entries:
@@ -221,30 +395,118 @@ class RaftNode:
             )
             entries.append(entry)
         
-        # Delegate to election manager
-        success = self.election_manager.handle_append_entries(
-            request.term,
-            request.leader_id,
-            request.prev_log_index,
-            request.prev_log_term,
-            entries,
-            request.leader_commit
-        )
+        # Apply log entries
+        if entries:
+            # Truncate log if necessary
+            if request.prev_log_index < len(self.storage.get_log_entries()):
+                self.storage.truncate_log_from(request.prev_log_index + 1)
+            
+            # Append new entries
+            self.storage.append_entries(entries)
+            logger.debug(f"Appended {len(entries)} entries to log")
+        
+        # Update commit index
+        if request.leader_commit > self.commit_index:
+            self.commit_index = min(request.leader_commit, len(self.storage.get_log_entries()))
+            self.storage.set_commit_index(self.commit_index)
+            
+            # Apply newly committed entries
+            await self._apply_committed_entries()
         
         # Update storage
         self.storage.set_current_term(self.election_manager.current_term)
         
-        # TODO: Handle log entries and commit index
-        
         # Create response
+        current_log_length = len(self.storage.get_log_entries())
         response = raft_pb2.AppendEntriesResponse(
             term=self.election_manager.current_term,
-            success=success,
-            match_index=len(self.storage.get_log_entries())  # TODO: Proper match index
+            success=True,
+            match_index=current_log_length
         )
         
-        logger.debug(f"Append entries response: success={success}")
+        logger.debug(f"Append entries response: success=True, match_index={response.match_index}")
         return response
+    
+    def _check_log_matching(self, prev_log_index: int, prev_log_term: int) -> bool:
+        """
+        Check if the log matches at the given index and term.
+        
+        Args:
+            prev_log_index: Index to check
+            prev_log_term: Expected term at that index
+            
+        Returns:
+            True if log matches, False otherwise
+        """
+        if prev_log_index == 0:
+            return True
+        
+        if prev_log_index > len(self.storage.get_log_entries()):
+            return False
+        
+        entry = self.storage.get_log_entry(prev_log_index)
+        if not entry:
+            return False
+        
+        return entry.term == prev_log_term
+    
+    async def _heartbeat_loop(self) -> None:
+        """Send heartbeats to all followers."""
+        from .types import HEARTBEAT_INTERVAL
+        
+        while self.state == RaftState.LEADER:
+            try:
+                # Send heartbeats to all peers
+                heartbeat_tasks = []
+                for peer in self.peers:
+                    task = asyncio.create_task(self._send_heartbeat_to_peer(peer))
+                    heartbeat_tasks.append(task)
+                
+                if heartbeat_tasks:
+                    await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
+                
+                # Wait for next heartbeat
+                await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
+                
+            except asyncio.CancelledError:
+                logger.debug("Heartbeat loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}")
+                await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
+    
+    async def _send_heartbeat_to_peer(self, peer: PeerInfo) -> None:
+        """Send heartbeat (empty AppendEntries) to a peer."""
+        try:
+            # Get previous log entry info
+            prev_log_index = self.next_index[peer.node_id] - 1
+            prev_log_term = 0
+            if prev_log_index > 0:
+                prev_entry = self.storage.get_log_entry(prev_log_index)
+                if prev_entry:
+                    prev_log_term = prev_entry.term
+            
+            # Send empty AppendEntries (heartbeat)
+            response = await self._append_entries_to_peer(
+                peer.node_id, peer,
+                self.election_manager.current_term,
+                prev_log_index, prev_log_term,
+                [],  # Empty entries for heartbeat
+                self.commit_index
+            )
+            
+            if response and response.success:
+                # Update match_index
+                self.match_index[peer.node_id] = prev_log_index
+                logger.debug(f"Sent heartbeat to {peer.node_id}")
+            else:
+                # Decrement next_index for retry
+                if self.next_index[peer.node_id] > 1:
+                    self.next_index[peer.node_id] -= 1
+                logger.debug(f"Heartbeat failed to {peer.node_id}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to send heartbeat to {peer.node_id}: {e}")
     
     # Client API methods
     
@@ -261,7 +523,7 @@ class RaftNode:
     async def put_price(self, symbol: str, price: float, timestamp: int) -> Dict[str, Any]:
         """
         Handle PutPrice request.
-        For Week 1, just return NOT_LEADER unless we're the leader.
+        Only leader accepts writes and replicates them.
         """
         if self.state != RaftState.LEADER:
             # Find current leader (for now, just return None)
@@ -276,26 +538,82 @@ class RaftNode:
                 "error_message": "Not leader"
             }
         
-        # TODO: In Week 2, implement actual log replication
-        logger.info(f"Leader received PutPrice: {symbol}={price}")
-        
-        return {
-            "ok": True,
-            "leader_hint": self.node_id,
-            "error_message": None
-        }
+        try:
+            # Serialize command
+            command_bytes = serialize_put_command(symbol, price, timestamp)
+            
+            # Create log entry
+            log_index = self.storage.get_last_log_index() + 1
+            entry = LogEntry(
+                index=log_index,
+                term=self.election_manager.current_term,
+                command_bytes=command_bytes
+            )
+            
+            # Append to local log
+            self.storage.append_entries([entry])
+            logger.info(f"Leader appended PutPrice: {symbol}={price} at index {log_index}")
+            
+            # Replicate to followers
+            success = await self._replicate_to_peers([entry])
+            
+            if success:
+                # Update commit index and apply
+                await self._update_commit_index()
+                
+                return {
+                    "ok": True,
+                    "leader_hint": self.node_id,
+                    "error_message": None
+                }
+            else:
+                # Replication failed
+                return {
+                    "ok": False,
+                    "leader_hint": self.node_id,
+                    "error_message": "Failed to replicate to majority"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in PutPrice: {e}")
+            return {
+                "ok": False,
+                "leader_hint": self.node_id,
+                "error_message": str(e)
+            }
     
     async def get_price(self, symbol: str) -> Dict[str, Any]:
         """
         Handle GetPrice request.
-        For Week 1, just return not found.
+        Read from committed state.
         """
-        # TODO: In Week 2, implement actual KV store lookup
-        return {
-            "ticker_price": None,
-            "found": False,
-            "error_message": "Price not found"
-        }
+        try:
+            ticker_price = self.kv_state_machine.get(symbol)
+            
+            if ticker_price:
+                return {
+                    "ticker_price": {
+                        "symbol": ticker_price.symbol,
+                        "price": ticker_price.price,
+                        "timestamp": ticker_price.timestamp
+                    },
+                    "found": True,
+                    "error_message": None
+                }
+            else:
+                return {
+                    "ticker_price": None,
+                    "found": False,
+                    "error_message": "Price not found"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in GetPrice: {e}")
+            return {
+                "ticker_price": None,
+                "found": False,
+                "error_message": str(e)
+            }
     
     def get_state_info(self) -> Dict[str, Any]:
         """Get detailed state information for debugging."""

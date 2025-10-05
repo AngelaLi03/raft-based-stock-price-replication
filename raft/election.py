@@ -210,9 +210,8 @@ class ElectionManager:
         try:
             logger.debug(f"Sending heartbeat to {peer_id}")
             
-            # Call the append entries callback (implemented by RaftNode)
-            # For now, we'll implement this in Week 2 - just log the heartbeat
-            logger.debug(f"Would send heartbeat to {peer_id}")
+            # This will be handled by the RaftNode's heartbeat mechanism
+            # The actual AppendEntries call is made by the RaftNode
             
         except Exception as e:
             logger.warning(f"Failed to send heartbeat to {peer_id}: {e}")

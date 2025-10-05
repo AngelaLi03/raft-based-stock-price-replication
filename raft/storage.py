@@ -140,9 +140,26 @@ class RaftStorage:
             logger.debug(f"Truncated log from index {index}")
     
     def get_commit_index(self) -> int:
-        """Get the commit index (for now, just return last log index)."""
-        return len(self.log)
+        """Get the commit index."""
+        if os.path.exists(self.meta_file):
+            try:
+                with open(self.meta_file, 'r') as f:
+                    meta = json.load(f)
+                    return meta.get("commit_index", 0)
+            except Exception as e:
+                logger.warning(f"Failed to load commit index: {e}")
+        return 0
     
     def set_commit_index(self, commit_index: int) -> None:
-        """Set the commit index (for now, just log it)."""
-        logger.debug(f"Commit index set to {commit_index}")
+        """Set the commit index and persist it."""
+        try:
+            meta = {
+                "current_term": self.current_term,
+                "voted_for": self.voted_for,
+                "commit_index": commit_index
+            }
+            with open(self.meta_file, 'w') as f:
+                json.dump(meta, f, indent=2)
+            logger.debug(f"Commit index set to {commit_index}")
+        except Exception as e:
+            logger.error(f"Failed to save commit index: {e}")

@@ -140,6 +140,20 @@ async def test_put_price_as_leader(raft_node):
     """Test put price when leader."""
     # Make node leader
     raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 1
+    
+    # Initialize leader state
+    for peer in raft_node.peers:
+        raft_node.next_index[peer.node_id] = 1
+        raft_node.match_index[peer.node_id] = 0
+    
+    # Mock replication to succeed
+    raft_node._replicate_to_peers = AsyncMock(return_value=True)
+    raft_node._update_commit_index = AsyncMock()
+    
+    # Mock storage
+    raft_node.storage.get_last_log_index = MagicMock(return_value=0)
+    raft_node.storage.append_entries = MagicMock()
     
     result = await raft_node.put_price("AAPL", 150.0, 1234567890)
     
