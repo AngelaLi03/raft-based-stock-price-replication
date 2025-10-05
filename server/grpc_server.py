@@ -189,6 +189,75 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
                 node_id="",
                 role="unknown"
             )
+    
+    async def DumpState(self, request, context):
+        """Handle DumpState RPC."""
+        logger.debug("Received DumpState")
+        
+        try:
+            result = await self.raft_node.dump_state()
+            
+            if result["ok"]:
+                # Convert KV store to protobuf format
+                kv_store = []
+                for symbol, ticker_price_dict in result["kv_store"].items():
+                    kv_store.append(client_pb2.TickerPrice(
+                        symbol=symbol,
+                        price=ticker_price_dict["price"],
+                        timestamp=ticker_price_dict["timestamp"]
+                    ))
+                
+                # Convert metrics to protobuf format
+                metrics = None
+                if result.get("metrics"):
+                    metrics = client_pb2.RaftMetrics(
+                        elections_total=result["metrics"].get("elections_total", 0),
+                        election_duration_ms=result["metrics"].get("election_duration_ms", 0.0),
+                        entries_replicated_total=result["metrics"].get("entries_replicated_total", 0),
+                        replication_latency_ms=result["metrics"].get("replication_latency_ms", 0.0),
+                        replication_failures_total=result["metrics"].get("replication_failures_total", 0),
+                        commits_total=result["metrics"].get("commits_total", 0),
+                        commit_latency_ms=result["metrics"].get("commit_latency_ms", 0.0),
+                        crash_recoveries_total=result["metrics"].get("crash_recoveries_total", 0),
+                        replay_entries_total=result["metrics"].get("replay_entries_total", 0),
+                        snapshot_load_time_ms=result["metrics"].get("snapshot_load_time_ms", 0.0),
+                        catchup_latency_ms=result["metrics"].get("catchup_latency_ms", 0.0),
+                        log_entries_total=result["metrics"].get("log_entries_total", 0),
+                        storage_writes_total=result["metrics"].get("storage_writes_total", 0),
+                        storage_reads_total=result["metrics"].get("storage_reads_total", 0),
+                        commands_applied_total=result["metrics"].get("commands_applied_total", 0),
+                        kv_entries_total=result["metrics"].get("kv_entries_total", 0)
+                    )
+                
+                response = client_pb2.DumpStateResponse(
+                    ok=True,
+                    error_message="",
+                    node_id=result["node_id"],
+                    current_term=result["current_term"],
+                    state=result["state"],
+                    commit_index=result["commit_index"],
+                    last_applied=result["last_applied"],
+                    log_length=result["log_length"],
+                    kv_entries=result["kv_entries"],
+                    kv_store=kv_store,
+                    metrics=metrics
+                )
+            else:
+                response = client_pb2.DumpStateResponse(
+                    ok=False,
+                    error_message=result["error_message"]
+                )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error handling DumpState: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return client_pb2.DumpStateResponse(
+                ok=False,
+                error_message=str(e)
+            )
 
 
 class GrpcServer:

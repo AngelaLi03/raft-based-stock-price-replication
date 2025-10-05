@@ -8,6 +8,7 @@ service ClientService {
     rpc BatchPutPrice(BatchPutPriceRequest) returns (BatchPutPriceResponse);
     rpc GetPrice(GetPriceRequest) returns (GetPriceResponse);
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
 
 // Stock price data
@@ -61,4 +62,49 @@ message GetClusterInfoResponse {
     repeated string members = 3;    // list of cluster member IDs
     string node_id = 4;             // ID of the node responding
     string role = 5;                // "leader", "follower", or "candidate"
+}
+
+// DumpState request/response
+message DumpStateRequest {
+    // Empty request
+}
+
+message DumpStateResponse {
+    bool ok = 1;                    // true if operation succeeded
+    string error_message = 2;       // error description if ok=false
+    
+    // Node state
+    string node_id = 3;             // node ID
+    uint64 current_term = 4;        // current term
+    string state = 5;               // current state
+    uint64 commit_index = 6;        // commit index
+    uint64 last_applied = 7;        // last applied index
+    uint64 log_length = 8;          // log length
+    uint64 kv_entries = 9;          // number of KV entries
+    
+    // KV store contents
+    repeated TickerPrice kv_store = 10;
+    
+    // Metrics
+    RaftMetrics metrics = 11;
+}
+
+// Raft metrics
+message RaftMetrics {
+    uint64 elections_total = 1;
+    double election_duration_ms = 2;
+    uint64 entries_replicated_total = 3;
+    double replication_latency_ms = 4;
+    uint64 replication_failures_total = 5;
+    uint64 commits_total = 6;
+    double commit_latency_ms = 7;
+    uint64 crash_recoveries_total = 8;
+    uint64 replay_entries_total = 9;
+    double snapshot_load_time_ms = 10;
+    double catchup_latency_ms = 11;
+    uint64 log_entries_total = 12;
+    uint64 storage_writes_total = 13;
+    uint64 storage_reads_total = 14;
+    uint64 commands_applied_total = 15;
+    uint64 kv_entries_total = 16;
 }

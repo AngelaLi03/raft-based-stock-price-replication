@@ -1,13 +1,16 @@
 """
 Durable storage abstraction for Raft log.
-MVP implementation using simple file-based storage.
+Production implementation with atomic writes, fsync, and crash recovery.
 """
 
 import json
 import os
+import tempfile
+import asyncio
 from typing import List, Optional
 from dataclasses import asdict
 import logging
+import time
 
 from .types import LogEntry
 
@@ -38,9 +41,11 @@ class RaftStorage:
         self._load_log()
     
     def _load_metadata(self) -> None:
-        """Load persistent metadata (term, voted_for, etc.)."""
+        """Load persistent metadata (term, voted_for, commit_index, last_applied)."""
         self.current_term = 0
         self.voted_for: Optional[str] = None
+        self.commit_index = 0
+        self.last_applied = 0
         
         if os.path.exists(self.meta_file):
             try:
@@ -48,9 +53,15 @@ class RaftStorage:
                     meta = json.load(f)
                     self.current_term = meta.get("current_term", 0)
                     self.voted_for = meta.get("voted_for")
-                    logger.info(f"Loaded metadata: term={self.current_term}, voted_for={self.voted_for}")
+                    self.commit_index = meta.get("commit_index", 0)
+                    self.last_applied = meta.get("last_applied", 0)
+                    logger.info(f"Loaded metadata: term={self.current_term}, voted_for={self.voted_for}, commit_index={self.commit_index}, last_applied={self.last_applied}")
             except Exception as e:
                 logger.warning(f"Failed to load metadata: {e}")
+                self.current_term = 0
+                self.voted_for = None
+                self.commit_index = 0
+                self.last_applied = 0
     
     def _load_log(self) -> None:
         """Load log entries from disk."""
@@ -66,25 +77,51 @@ class RaftStorage:
                 logger.warning(f"Failed to load log: {e}")
     
     def _save_metadata(self) -> None:
-        """Save metadata to disk."""
+        """Save metadata to disk with atomic write and fsync."""
         try:
             meta = {
                 "current_term": self.current_term,
-                "voted_for": self.voted_for
+                "voted_for": self.voted_for,
+                "commit_index": self.commit_index,
+                "last_applied": self.last_applied,
+                "timestamp": int(time.time())
             }
-            with open(self.meta_file, 'w') as f:
-                json.dump(meta, f, indent=2)
+            self._atomic_write(self.meta_file, json.dumps(meta, indent=2))
         except Exception as e:
             logger.error(f"Failed to save metadata: {e}")
     
     def _save_log(self) -> None:
-        """Save log entries to disk."""
+        """Save log entries to disk with atomic write and fsync."""
         try:
             log_data = [entry.to_dict() for entry in self.log]
-            with open(self.log_file, 'w') as f:
-                json.dump(log_data, f, indent=2)
+            self._atomic_write(self.log_file, json.dumps(log_data, indent=2))
         except Exception as e:
             logger.error(f"Failed to save log: {e}")
+    
+    def _atomic_write(self, filepath: str, content: str) -> None:
+        """
+        Atomically write content to file with fsync for durability.
+        
+        Args:
+            filepath: Target file path
+            content: Content to write
+        """
+        # Write to temporary file first
+        temp_file = filepath + ".tmp"
+        try:
+            with open(temp_file, 'w') as f:
+                f.write(content)
+                f.flush()  # Ensure data is written to OS buffer
+                os.fsync(f.fileno())  # Force data to disk
+            
+            # Atomic rename
+            os.rename(temp_file, filepath)
+            
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+            raise e
     
     def get_current_term(self) -> int:
         """Get the current term."""
@@ -141,25 +178,20 @@ class RaftStorage:
     
     def get_commit_index(self) -> int:
         """Get the commit index."""
-        if os.path.exists(self.meta_file):
-            try:
-                with open(self.meta_file, 'r') as f:
-                    meta = json.load(f)
-                    return meta.get("commit_index", 0)
-            except Exception as e:
-                logger.warning(f"Failed to load commit index: {e}")
-        return 0
+        return self.commit_index
     
     def set_commit_index(self, commit_index: int) -> None:
         """Set the commit index and persist it."""
-        try:
-            meta = {
-                "current_term": self.current_term,
-                "voted_for": self.voted_for,
-                "commit_index": commit_index
-            }
-            with open(self.meta_file, 'w') as f:
-                json.dump(meta, f, indent=2)
-            logger.debug(f"Commit index set to {commit_index}")
-        except Exception as e:
-            logger.error(f"Failed to save commit index: {e}")
+        self.commit_index = commit_index
+        self._save_metadata()
+        logger.debug(f"Commit index set to {commit_index}")
+    
+    def get_last_applied(self) -> int:
+        """Get the last applied index."""
+        return self.last_applied
+    
+    def set_last_applied(self, last_applied: int) -> None:
+        """Set the last applied index and persist it."""
+        self.last_applied = last_applied
+        self._save_metadata()
+        logger.debug(f"Last applied index set to {last_applied}")

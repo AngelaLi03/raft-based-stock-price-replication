@@ -5,6 +5,8 @@ Key-Value state machine for applying committed Raft log entries.
 import json
 import logging
 import time
+import os
+import tempfile
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 import asyncio
@@ -129,11 +131,17 @@ class KVStateMachine:
     async def apply_command(self, log_entry) -> None:
         """
         Apply a committed log entry to the state machine.
+        This method is idempotent - applying the same entry multiple times is safe.
         
         Args:
             log_entry: LogEntry from Raft log
         """
         try:
+            # Skip if already applied (idempotency)
+            if log_entry.index <= self.last_applied_index:
+                logger.debug(f"Skipping already applied entry {log_entry.index}")
+                return
+            
             # Deserialize command
             command_data = json.loads(log_entry.command_bytes.decode('utf-8'))
             command = Command.from_dict(command_data)
@@ -158,6 +166,22 @@ class KVStateMachine:
         except Exception as e:
             logger.error(f"Failed to apply command at index {log_entry.index}: {e}")
             raise
+    
+    async def replay_log_entries(self, log_entries: List, start_index: int = 1) -> None:
+        """
+        Replay log entries for crash recovery.
+        
+        Args:
+            log_entries: List of LogEntry objects to replay
+            start_index: Starting index for replay (default 1)
+        """
+        logger.info(f"Replaying {len(log_entries)} log entries starting from index {start_index}")
+        
+        for entry in log_entries:
+            if entry.index >= start_index:
+                await self.apply_command(entry)
+        
+        logger.info(f"Replay complete. Last applied index: {self.last_applied_index}")
     
     def get(self, key: str) -> Optional[TickerPrice]:
         """
@@ -208,22 +232,47 @@ class KVStateMachine:
             self.last_applied_index = 0
     
     async def _save_state(self) -> None:
-        """Save state to persistent storage."""
+        """Save state to persistent storage with atomic write and fsync."""
         try:
-            import os
             os.makedirs(self.data_dir, exist_ok=True)
             
             data = {
                 "last_applied_index": self.last_applied_index,
                 "entries": {k: v.to_dict() for k, v in self.store.items()},
-                "timestamp": int(time.time())
+                "timestamp": int(time.time()),
+                "version": "1.0"
             }
             
-            with open(self.state_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            self._atomic_write(self.state_file, json.dumps(data, indent=2))
+            logger.debug(f"Saved KV state with {len(self.store)} entries")
                 
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+    
+    def _atomic_write(self, filepath: str, content: str) -> None:
+        """
+        Atomically write content to file with fsync for durability.
+        
+        Args:
+            filepath: Target file path
+            content: Content to write
+        """
+        # Write to temporary file first
+        temp_file = filepath + ".tmp"
+        try:
+            with open(temp_file, 'w') as f:
+                f.write(content)
+                f.flush()  # Ensure data is written to OS buffer
+                os.fsync(f.fileno())  # Force data to disk
+            
+            # Atomic rename
+            os.rename(temp_file, filepath)
+            
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+            raise e
     
     async def _persistence_loop(self) -> None:
         """Background task to periodically save state."""

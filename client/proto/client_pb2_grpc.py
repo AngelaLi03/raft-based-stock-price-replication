@@ -55,6 +55,11 @@ class ClientServiceStub(object):
                 request_serializer=client__pb2.GetClusterInfoRequest.SerializeToString,
                 response_deserializer=client__pb2.GetClusterInfoResponse.FromString,
                 _registered_method=True)
+        self.DumpState = channel.unary_unary(
+                '/client.ClientService/DumpState',
+                request_serializer=client__pb2.DumpStateRequest.SerializeToString,
+                response_deserializer=client__pb2.DumpStateResponse.FromString,
+                _registered_method=True)
 
 
 class ClientServiceServicer(object):
@@ -85,6 +90,12 @@ class ClientServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DumpState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ClientServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -107,6 +118,11 @@ def add_ClientServiceServicer_to_server(servicer, server):
                     servicer.GetClusterInfo,
                     request_deserializer=client__pb2.GetClusterInfoRequest.FromString,
                     response_serializer=client__pb2.GetClusterInfoResponse.SerializeToString,
+            ),
+            'DumpState': grpc.unary_unary_rpc_method_handler(
+                    servicer.DumpState,
+                    request_deserializer=client__pb2.DumpStateRequest.FromString,
+                    response_serializer=client__pb2.DumpStateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -218,6 +234,33 @@ class ClientService(object):
             '/client.ClientService/GetClusterInfo',
             client__pb2.GetClusterInfoRequest.SerializeToString,
             client__pb2.GetClusterInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DumpState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/client.ClientService/DumpState',
+            client__pb2.DumpStateRequest.SerializeToString,
+            client__pb2.DumpStateResponse.FromString,
             options,
             channel_credentials,
             insecure,

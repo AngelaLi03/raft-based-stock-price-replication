@@ -107,6 +107,54 @@ class RaftClient:
         except Exception as e:
             logger.error(f"Failed to get price: {e}")
             return None
+    
+    async def dump_state(self) -> Optional[dict]:
+        """Dump local node state."""
+        try:
+            async with grpc.aio.insecure_channel(self.address) as channel:
+                stub = client_pb2_grpc.ClientServiceStub(channel)
+                
+                request = client_pb2.DumpStateRequest()
+                response = await stub.DumpState(request)
+                
+                if response.ok:
+                    kv_store = []
+                    for entry in response.kv_store:
+                        kv_store.append({
+                            "symbol": entry.symbol,
+                            "price": entry.price,
+                            "timestamp": entry.timestamp
+                        })
+                    
+                    return {
+                        "ok": True,
+                        "node_id": response.node_id,
+                        "current_term": response.current_term,
+                        "state": response.state,
+                        "commit_index": response.commit_index,
+                        "last_applied": response.last_applied,
+                        "log_length": response.log_length,
+                        "kv_entries": response.kv_entries,
+                        "kv_store": kv_store,
+                        "metrics": {
+                            "elections_total": response.metrics.elections_total,
+                            "entries_replicated_total": response.metrics.entries_replicated_total,
+                            "commits_total": response.metrics.commits_total,
+                            "crash_recoveries_total": response.metrics.crash_recoveries_total,
+                            "replay_entries_total": response.metrics.replay_entries_total,
+                            "storage_writes_total": response.metrics.storage_writes_total,
+                            "commands_applied_total": response.metrics.commands_applied_total
+                        } if response.metrics else None
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "error_message": response.error_message
+                    }
+                
+        except Exception as e:
+            logger.error(f"Failed to dump state: {e}")
+            return None
 
 
 async def cmd_cluster_info(args):
@@ -169,6 +217,51 @@ async def cmd_get_price(args):
     return 0
 
 
+async def cmd_dump_state(args):
+    """Handle dump-state command."""
+    client = RaftClient(args.host, args.port)
+    
+    print(f"Dumping state from {client.address}...")
+    
+    result = await client.dump_state()
+    if result is None:
+        print("Failed to dump state")
+        return 1
+    
+    if result["ok"]:
+        print("=== Node State Dump ===")
+        print(f"Node ID: {result['node_id']}")
+        print(f"Current Term: {result['current_term']}")
+        print(f"State: {result['state']}")
+        print(f"Commit Index: {result['commit_index']}")
+        print(f"Last Applied: {result['last_applied']}")
+        print(f"Log Length: {result['log_length']}")
+        print(f"KV Entries: {result['kv_entries']}")
+        print()
+        
+        if result['kv_entries'] > 0:
+            print("=== KV Store Contents ===")
+            for entry in result['kv_store']:
+                print(f"  {entry['symbol']}: ${entry['price']:.2f} (timestamp: {entry['timestamp']})")
+            print()
+        
+        if result.get('metrics'):
+            print("=== Metrics ===")
+            metrics = result['metrics']
+            print(f"  Elections: {metrics.get('elections_total', 0)}")
+            print(f"  Replicated Entries: {metrics.get('entries_replicated_total', 0)}")
+            print(f"  Commits: {metrics.get('commits_total', 0)}")
+            print(f"  Crash Recoveries: {metrics.get('crash_recoveries_total', 0)}")
+            print(f"  Replay Entries: {metrics.get('replay_entries_total', 0)}")
+            print(f"  Storage Writes: {metrics.get('storage_writes_total', 0)}")
+            print(f"  Commands Applied: {metrics.get('commands_applied_total', 0)}")
+    else:
+        print(f"Error: {result['error_message']}")
+        return 1
+    
+    return 0
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(description="Raft cluster CLI tool")
@@ -193,6 +286,11 @@ def main():
     get_price_parser.add_argument("--port", type=int, default=50061, help="Server port")
     get_price_parser.add_argument("symbol", help="Stock symbol (e.g., AAPL)")
     
+    # dump-state command
+    dump_state_parser = subparsers.add_parser("dump-state", help="Dump local node state")
+    dump_state_parser.add_argument("--host", default="localhost", help="Server hostname")
+    dump_state_parser.add_argument("--port", type=int, default=50061, help="Server port")
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -206,6 +304,8 @@ def main():
         return asyncio.run(cmd_put_price(args))
     elif args.command == "get-price":
         return asyncio.run(cmd_get_price(args))
+    elif args.command == "dump-state":
+        return asyncio.run(cmd_dump_state(args))
     else:
         print(f"Unknown command: {args.command}")
         return 1

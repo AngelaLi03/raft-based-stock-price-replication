@@ -36,6 +36,13 @@ class RaftNode:
         # Initialize KV state machine
         self.kv_state_machine = KVStateMachine(data_dir)
         
+        # Initialize metrics
+        try:
+            from raft.metrics import init_metrics
+            init_metrics(node_id)
+        except ImportError:
+            pass  # Metrics not available
+        
         # Initialize election manager
         self.election_manager = ElectionManager(
             node_id=node_id,
@@ -61,25 +68,43 @@ class RaftNode:
         logger.info(f"Raft node {node_id} initialized with {len(peers)} peers")
     
     async def start(self) -> None:
-        """Start the Raft node."""
+        """Start the Raft node with crash recovery."""
         logger.info(f"Starting Raft node {self.node_id}")
         
         # Load persistent state
         self.election_manager.current_term = self.storage.get_current_term()
         self.election_manager.voted_for = self.storage.get_voted_for()
         self.commit_index = self.storage.get_commit_index()
-        self.last_applied = self.commit_index
+        self.last_applied = self.storage.get_last_applied()
+        
+        # Ensure commit index doesn't exceed log length (in case of log truncation)
+        log_length = len(self.storage.get_log_entries())
+        if self.commit_index > log_length:
+            logger.warning(f"Commit index {self.commit_index} exceeds log length {log_length}, adjusting")
+            self.commit_index = log_length
+            self.storage.set_commit_index(self.commit_index)
+        
+        # Ensure last_applied doesn't exceed commit_index
+        if self.last_applied > self.commit_index:
+            logger.warning(f"Last applied {self.last_applied} exceeds commit index {self.commit_index}, adjusting")
+            self.last_applied = self.commit_index
+            self.storage.set_last_applied(self.last_applied)
+        
+        logger.info(f"Recovered state: term={self.election_manager.current_term}, commit_index={self.commit_index}, last_applied={self.last_applied}")
         
         # Start KV state machine
         await self.kv_state_machine.start()
         
-        # Apply any unapplied committed entries
-        await self._apply_committed_entries()
+        # Synchronize KV state machine's last_applied_index with Raft node's last_applied
+        self.kv_state_machine.last_applied_index = self.last_applied
+        
+        # Replay any unapplied committed entries for crash recovery
+        await self._recover_from_crash()
         
         # Start as follower with election timeout
         self.election_manager.start_election_timeout()
         
-        logger.info(f"Raft node {self.node_id} started as {self.state.value}")
+        logger.info(f"Raft node {self.node_id} started as {self.state.value} (recovery complete)")
     
     async def stop(self) -> None:
         """Stop the Raft node."""
@@ -214,6 +239,42 @@ class RaftNode:
         
         logger.info(f"Node {self.node_id} became follower")
     
+    async def _recover_from_crash(self) -> None:
+        """Recover from crash by replaying unapplied committed entries."""
+        logger.info(f"Starting crash recovery: last_applied={self.last_applied}, commit_index={self.commit_index}")
+        
+        # Start timing recovery
+        import time
+        start_time = time.time()
+        
+        if self.last_applied < self.commit_index:
+            # Get all unapplied committed entries
+            unapplied_entries = []
+            for i in range(self.last_applied + 1, self.commit_index + 1):
+                entry = self.storage.get_log_entry(i)
+                if entry:
+                    unapplied_entries.append(entry)
+            
+            if unapplied_entries:
+                logger.info(f"Replaying {len(unapplied_entries)} unapplied entries for crash recovery")
+                await self.kv_state_machine.replay_log_entries(unapplied_entries, self.last_applied + 1)
+                
+                # Update last_applied to match commit_index
+                self.last_applied = self.commit_index
+                self.storage.set_last_applied(self.last_applied)
+                
+                # Record metrics
+                duration_ms = (time.time() - start_time) * 1000
+                try:
+                    from raft.metrics import record_crash_recovery
+                    record_crash_recovery(len(unapplied_entries), duration_ms)
+                except ImportError:
+                    pass
+                
+                logger.info(f"Crash recovery complete: last_applied={self.last_applied}")
+        else:
+            logger.info("No unapplied entries found, recovery not needed")
+    
     async def _apply_committed_entries(self) -> None:
         """Apply all committed entries that haven't been applied yet."""
         while self.last_applied < self.commit_index:
@@ -222,6 +283,9 @@ class RaftNode:
             if entry:
                 await self.kv_state_machine.apply_command(entry)
                 logger.debug(f"Applied entry {self.last_applied} to state machine")
+            
+            # Persist last_applied after each entry
+            self.storage.set_last_applied(self.last_applied)
     
     async def _replicate_to_peers(self, entries: List[LogEntry]) -> bool:
         """
@@ -397,18 +461,23 @@ class RaftNode:
         
         # Apply log entries
         if entries:
-            # Truncate log if necessary
+            # Truncate log if necessary (log matching property)
             if request.prev_log_index < len(self.storage.get_log_entries()):
+                logger.info(f"Truncating log from index {request.prev_log_index + 1} for catch-up")
                 self.storage.truncate_log_from(request.prev_log_index + 1)
             
             # Append new entries
             self.storage.append_entries(entries)
-            logger.debug(f"Appended {len(entries)} entries to log")
+            logger.info(f"Appended {len(entries)} entries to log (catch-up)")
         
         # Update commit index
         if request.leader_commit > self.commit_index:
+            old_commit_index = self.commit_index
             self.commit_index = min(request.leader_commit, len(self.storage.get_log_entries()))
             self.storage.set_commit_index(self.commit_index)
+            
+            if self.commit_index > old_commit_index:
+                logger.info(f"Updated commit index from {old_commit_index} to {self.commit_index}")
             
             # Apply newly committed entries
             await self._apply_committed_entries()
@@ -567,7 +636,10 @@ class RaftNode:
                     "error_message": None
                 }
             else:
-                # Replication failed
+                # Replication failed - remove the entry from log
+                logger.warning(f"Replication failed for entry {log_index}, removing from log")
+                self.storage.truncate_log(log_index - 1)
+                
                 return {
                     "ok": False,
                     "leader_hint": self.node_id,
@@ -612,6 +684,42 @@ class RaftNode:
             return {
                 "ticker_price": None,
                 "found": False,
+                "error_message": str(e)
+            }
+    
+    async def dump_state(self) -> Dict[str, Any]:
+        """Dump local node state for debugging and monitoring."""
+        try:
+            # Get KV store contents
+            kv_store = self.kv_state_machine.dump_state()
+            
+            # Get metrics if available
+            metrics = None
+            try:
+                from raft.metrics import get_metrics
+                metrics_collector = get_metrics()
+                if metrics_collector:
+                    metrics = metrics_collector.get_metrics()
+            except ImportError:
+                pass  # Metrics not available
+            
+            return {
+                "ok": True,
+                "node_id": self.node_id,
+                "current_term": self.election_manager.current_term,
+                "state": self.state.value,
+                "commit_index": self.commit_index,
+                "last_applied": self.last_applied,
+                "log_length": len(self.storage.get_log_entries()),
+                "kv_entries": len(kv_store.get("entries", {})),
+                "kv_store": kv_store.get("entries", {}),
+                "metrics": metrics
+            }
+            
+        except Exception as e:
+            logger.error(f"Error dumping state: {e}")
+            return {
+                "ok": False,
                 "error_message": str(e)
             }
     
