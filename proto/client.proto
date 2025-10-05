@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package client;
+
+// Client API service
+service ClientService {
+    rpc PutPrice(PutPriceRequest) returns (PutPriceResponse);
+    rpc BatchPutPrice(BatchPutPriceRequest) returns (BatchPutPriceResponse);
+    rpc GetPrice(GetPriceRequest) returns (GetPriceResponse);
+    rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+}
+
+// Stock price data
+message TickerPrice {
+    string symbol = 1;    // stock symbol (e.g., "AAPL", "NVDA")
+    double price = 2;     // current price
+    int64 timestamp = 3;  // unix timestamp in milliseconds
+}
+
+// PutPrice request/response
+message PutPriceRequest {
+    TickerPrice ticker_price = 1;
+}
+
+message PutPriceResponse {
+    bool ok = 1;                    // true if operation succeeded
+    string leader_hint = 2;         // current leader ID if not leader
+    string error_message = 3;       // error description if ok=false
+}
+
+// BatchPutPrice request/response
+message BatchPutPriceRequest {
+    repeated TickerPrice ticker_prices = 1;
+}
+
+message BatchPutPriceResponse {
+    bool ok = 1;
+    string leader_hint = 2;
+    string error_message = 3;
+}
+
+// GetPrice request/response
+message GetPriceRequest {
+    string symbol = 1;
+}
+
+message GetPriceResponse {
+    TickerPrice ticker_price = 1;
+    bool found = 2;                 // true if price was found
+    string error_message = 3;       // error description if found=false
+}
+
+// Cluster info request/response
+message GetClusterInfoRequest {
+    // Empty request
+}
+
+message GetClusterInfoResponse {
+    string leader_id = 1;           // current leader ID
+    uint64 term = 2;                // current term
+    repeated string members = 3;    // list of cluster member IDs
+    string node_id = 4;             // ID of the node responding
+    string role = 5;                // "leader", "follower", or "candidate"
+}

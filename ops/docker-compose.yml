@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile
+    container_name: raft-node1
+    environment:
+      - NODE_ID=node1
+      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - RAFT_PORT=50051
+      - CLIENT_PORT=50061
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+    ports:
+      - "50051:50051"  # Raft port
+      - "50061:50061"  # Client port
+    volumes:
+      - node1_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node2:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile
+    container_name: raft-node2
+    environment:
+      - NODE_ID=node2
+      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - RAFT_PORT=50052
+      - CLIENT_PORT=50062
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+    ports:
+      - "50052:50052"  # Raft port
+      - "50062:50062"  # Client port
+    volumes:
+      - node2_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node3:
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile
+    container_name: raft-node3
+    environment:
+      - NODE_ID=node3
+      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - RAFT_PORT=50053
+      - CLIENT_PORT=50063
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+    ports:
+      - "50053:50053"  # Raft port
+      - "50063:50063"  # Client port
+    volumes:
+      - node3_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+
+networks:
+  raft-network:
+    driver: bridge
