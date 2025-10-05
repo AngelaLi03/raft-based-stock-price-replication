@@ -172,21 +172,25 @@ async def cmd_get_price(args):
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(description="Raft cluster CLI tool")
-    parser.add_argument("--host", default="localhost", help="Server hostname")
-    parser.add_argument("--port", type=int, default=50061, help="Server port")
     
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
     # cluster-info command
     cluster_info_parser = subparsers.add_parser("cluster-info", help="Get cluster information")
+    cluster_info_parser.add_argument("--host", default="localhost", help="Server hostname")
+    cluster_info_parser.add_argument("--port", type=int, default=50061, help="Server port")
     
     # put-price command
     put_price_parser = subparsers.add_parser("put-price", help="Put a stock price")
+    put_price_parser.add_argument("--host", default="localhost", help="Server hostname")
+    put_price_parser.add_argument("--port", type=int, default=50061, help="Server port")
     put_price_parser.add_argument("symbol", help="Stock symbol (e.g., AAPL)")
     put_price_parser.add_argument("price", type=float, help="Stock price")
     
     # get-price command
     get_price_parser = subparsers.add_parser("get-price", help="Get a stock price")
+    get_price_parser.add_argument("--host", default="localhost", help="Server hostname")
+    get_price_parser.add_argument("--port", type=int, default=50061, help="Server port")
     get_price_parser.add_argument("symbol", help="Stock symbol (e.g., AAPL)")
     
     args = parser.parse_args()

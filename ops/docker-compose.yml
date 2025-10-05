@@ -8,7 +8,7 @@ services:
     container_name: raft-node1
     environment:
       - NODE_ID=node1
-      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
       - RAFT_PORT=50051
       - CLIENT_PORT=50061
       - DATA_DIR=/app/data
@@ -29,7 +29,7 @@ services:
     container_name: raft-node2
     environment:
       - NODE_ID=node2
-      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
       - RAFT_PORT=50052
       - CLIENT_PORT=50062
       - DATA_DIR=/app/data
@@ -50,7 +50,7 @@ services:
     container_name: raft-node3
     environment:
       - NODE_ID=node3
-      - PEER_LIST=node1:localhost:50051:50061,node2:localhost:50052:50062,node3:localhost:50053:50063
+      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
       - RAFT_PORT=50053
       - CLIENT_PORT=50063
       - DATA_DIR=/app/data
