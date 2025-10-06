@@ -545,7 +545,7 @@ class RaftNode:
                 await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
     
     async def _send_heartbeat_to_peer(self, peer: PeerInfo) -> None:
-        """Send heartbeat (empty AppendEntries) to a peer."""
+        """Send heartbeat and catch up missing entries to a peer."""
         try:
             # Get previous log entry info
             prev_log_index = self.next_index[peer.node_id] - 1
@@ -555,24 +555,39 @@ class RaftNode:
                 if prev_entry:
                     prev_log_term = prev_entry.term
             
-            # Send empty AppendEntries (heartbeat)
+            # Get entries to send (for catch-up)
+            entries_to_send = []
+            current_log_length = len(self.storage.get_log_entries())
+            if self.next_index[peer.node_id] <= current_log_length:
+                # Send missing entries for catch-up
+                for i in range(self.next_index[peer.node_id], current_log_length + 1):
+                    entry = self.storage.get_log_entry(i)
+                    if entry:
+                        entries_to_send.append(entry)
+            
+            # Send AppendEntries (with entries if catch-up needed, empty if heartbeat)
             response = await self._append_entries_to_peer(
                 peer.node_id, peer,
                 self.election_manager.current_term,
                 prev_log_index, prev_log_term,
-                [],  # Empty entries for heartbeat
+                entries_to_send,  # Send missing entries for catch-up
                 self.commit_index
             )
             
             if response and response.success:
-                # Update match_index
-                self.match_index[peer.node_id] = prev_log_index
-                logger.debug(f"Sent heartbeat to {peer.node_id}")
+                # Update next_index and match_index
+                if entries_to_send:
+                    self.next_index[peer.node_id] = len(entries_to_send) + self.next_index[peer.node_id]
+                    self.match_index[peer.node_id] = self.next_index[peer.node_id] - 1
+                    logger.info(f"Sent {len(entries_to_send)} entries to {peer.node_id} for catch-up")
+                else:
+                    self.match_index[peer.node_id] = prev_log_index
+                    logger.debug(f"Sent heartbeat to {peer.node_id}")
             else:
                 # Decrement next_index for retry
                 if self.next_index[peer.node_id] > 1:
                     self.next_index[peer.node_id] -= 1
-                logger.debug(f"Heartbeat failed to {peer.node_id}")
+                logger.debug(f"AppendEntries failed to {peer.node_id}, retrying with lower index")
                 
         except Exception as e:
             logger.warning(f"Failed to send heartbeat to {peer.node_id}: {e}")
