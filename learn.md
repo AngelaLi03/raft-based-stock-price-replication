@@ -319,13 +319,51 @@ This is the most instructive bug in the project, because unit tests structurally
 
 **Fix**: also call `_update_commit_index()` after a successful heartbeat-driven catch-up, not just after a batch flush. Verified by literally repeating the failure recipe against the running cluster after the fix, and confirming `commit_index` now advances immediately instead of waiting for a subsequent unrelated write.
 
+### 7. Metrics: a chain of four bugs, each one hidden behind the last
+
+This one is worth studying not for any single bug in it, but for the *shape* of the whole episode: fixing bug (a) was what made bug (b) possible to even notice; fixing (b) is what let (c) happen for the first time ever; fixing (c) is what finally let (d) run. None of these were introduced by fixing the previous one — all four had existed since the code was written. They were just standing in a line, each one hidden behind the failure of the one in front of it. This is a distinct lesson from bug #6 above: that one was about *timing and interleaving*; this one is about how **a silently-failing code path doesn't just fail — it hides every bug that lives downstream of it, indefinitely, until something forces that path open.**
+
+Starting point: two known, already-documented issues — `raft/prometheus_metrics.py` and `server/metrics_server.py` both tried to bind the same metrics port, and `dump-state` always showed 0 for every counter. Two bugs, one investigation session, but they turned into four.
+
+**(a) The port collision**
+
+- **Symptom**: node logs showed `Failed to start metrics server: [Errno 98] address already in use`, and `metrics_server.py`'s `/health` endpoint was unreachable.
+- **Root cause**: both files computed the metrics port the same way (`8000 + node number`), and both tried to bind it — `raft/prometheus_metrics.py`'s `PrometheusMetrics.__init__` calls `prometheus_client`'s own `start_http_server()`, and separately, `server/grpc_server.py` starts `metrics_server.py`'s aiohttp server on the same port a moment later. Since `RaftNode` (which constructs `PrometheusMetrics`) is built before the gRPC server starts, the first one always won the race and the second always lost, silently.
+- **How I got to the fix**: read both files in full rather than guessing. `metrics_server.py`'s `/metrics` handler already called `raft.prometheus_metrics.get_prometheus_metrics().get_metrics()` — the exact same registry `prometheus_client`'s built-in server was exposing — plus it uniquely served `/health`, which the built-in server doesn't provide at all. That made the two servers not "two independent things that happen to collide" but "one server doing a strict superset of what the other does, and losing the race to bind."
+- **Fix**: delete the redundant `start_http_server()` call. One server, not two.
+
+**(b) `dump-state` reading a collector nothing updates**
+
+- **Symptom**: `kvctl.py dump-state` always printed 0 for elections/commits/replicated-entries, even right after real writes.
+- **Root cause**: `RaftNode.dump_state()` read from `raft/metrics.py`'s old `MetricsCollector` — a *second, separate* metrics system, written before the project migrated to `raft/prometheus_metrics.py`, and never removed. Nothing had called that old collector's `record_*` functions since the migration; it was permanently frozen at all-zero.
+- **How I got to the fix**: `grep -rn "raft\.metrics"` across the whole codebase turned up exactly two call sites, both in `node.py`, confirming the old module was otherwise dead. Compared `PrometheusMetrics.get_metrics_dict()`'s output keys against what `dump_state()` and `kvctl.py`'s display code expected — the field names already matched exactly, so this was a drop-in swap, not a rewrite.
+- **Fix**: point `dump_state()` (and the one other live call site, in `_recover_from_crash`) at `raft/prometheus_metrics.py` instead. Once that was the only consumer, `raft/metrics.py` had zero remaining references anywhere in the codebase — deleted the whole file rather than leave dead code sitting there to confuse the next person (exactly the situation bug (a)/(b) themselves came from).
+
+**(c) `dump-state` immediately crashing anyway, but only once it started reading real data**
+
+- **Symptom**: with (a) and (b) both fixed, rebuilt the cluster, made a real write, and called `dump-state` for the first time against a node with non-zero metrics — and it crashed: `'float' object cannot be interpreted as an integer`, `grpc_status:13`.
+- **Root cause**: `prometheus_client`'s `Counter`/`Gauge` types store their value internally as a Python `float` *no matter what you increment them by* — `get_metrics_dict()`'s `._value.get()` calls therefore always return floats. But `client.proto`'s `RaftMetrics` message declares fields like `elections_total` as `uint64`, and protobuf's setter is strict: unlike, say, JSON, it refuses to silently coerce a float into an integer field. This code path had *never once executed with a non-zero value* before — the old dead collector in bug (b) was always all-zero, and `0`/`0.0` happen to both satisfy protobuf's int fields without erroring, so the bug had no way to surface until real data flowed through it for the first time.
+- **How I got to the fix**: the traceback pointed at the exact `client_pb2.RaftMetrics(...)` construction call in `grpc_server.py`; comparing the proto schema's field types against what the metrics dict actually contained made the mismatch obvious.
+- **Fix**: wrap every `*_total` field in `int(...)` at the point of protobuf construction (the `_ms` latency fields stay as floats — those really are `double` in the proto).
+
+**(d) `/metrics` returning HTTP 500, but only once it could actually be reached**
+
+- **Symptom**: with (a)-(c) fixed, `curl http://.../metrics` against a live node returned a 500.
+- **Root cause**: `metrics_server.py`'s handlers built the Content-Type header as one compound string, `'text/plain; version=0.0.4; charset=utf-8'`, and passed it as `content_type=` alongside `text=` to `aiohttp.web.Response`. Newer aiohttp versions explicitly forbid a `charset=` substring inside `content_type` when `text=` is also given — aiohttp wants to own charset negotiation itself, via a separate keyword, and raises `ValueError: charset must not be in content_type argument` rather than silently accepting the redundant value. Like (c), this line of code had existed since the file was written, but the aiohttp server had never once successfully bound *and served a real request* before (a) was fixed, so this had never actually run.
+- **How I got to the fix**: read the full container log traceback, which named the exact line and aiohttp's own source location raising the `ValueError` — no guessing required, just reading what was already being reported.
+- **Fix**: drop the embedded `;charset=utf-8` from the content-type string, keeping `;version=0.0.4`. aiohttp appends `;charset=utf-8` itself by default when `text=` is given, producing the identical final header without hitting the restriction.
+
+**Final result**: all four fixed, then re-verified live end to end against the rebuilt 15-node cluster — a real write followed by `dump-state` now shows correct non-zero counts instead of crashing, `curl /health` returns `200 OK`, and `curl /metrics` returns real Prometheus-format text instead of a 500. Neither `server/grpc_server.py` nor `server/metrics_server.py` had *any* test coverage before this — added `tests/test_grpc_server.py` (covering exactly the float→protobuf conversion that broke) and `tests/test_metrics_server.py` (covering exactly the content-type construction that broke), bringing the suite to 148 tests, all passing.
+
+**The general lesson**: when you fix a bug that was causing something to fail *silently* (a crash that's swallowed, a server that never starts, a code path that's always fed zeros), don't assume you're done once that one symptom goes away. Ask what that failure was *protecting you from seeing*. The right move after a fix like this is the same one that found bugs (c) and (d): go run the now-unblocked path for real, with real data, and see what happens.
+
 ---
 
 ## Part 7 — Testing Strategy: What Runs When, and What Each Layer Can (and Can't) Catch
 
 Think of this as a pyramid, cheapest/fastest at the bottom, most expensive/realistic at the top. You need all of it — each layer catches a different *class* of bug.
 
-### Layer 1 — Unit tests (`tests/*.py`, pytest, ~3.7s for all 143)
+### Layer 1 — Unit tests (`tests/*.py`, pytest, ~3.7s for all 148)
 
 Run on every change, take seconds. Test one function's logic in isolation, with its dependencies (network, sometimes disk) mocked out — e.g. "given these `match_index` values, does `_update_commit_index` compute the right majority index?" or "does `handle_vote_request` correctly deny a vote when the term is stale?"
 
