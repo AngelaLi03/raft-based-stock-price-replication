@@ -214,6 +214,35 @@ This creates a new problem: what if a follower is *so* far behind that the entri
 
 This is covered in depth in Part 6 and Part 7 — the short version: generating a 15-node cluster and config-validating it is not the same as *running* it. Only running it live surfaced a real concurrency bug that no unit test caught.
 
+### Step 8: Closing the Loop — Batch Updates (`BatchPutPrice`)
+
+`BatchPutPrice` was actually the *first* RPC defined in the proto contract (Step 0) but the *last* one actually implemented — it sat as a stub returning `ok=True` without touching its payload for the entire life of the project until this step. It's worth its own section because "batch update" is a genuinely useful, genuinely misunderstood idea, and because this codebase has **two different, easily-confused kinds of batching** operating at two different layers.
+
+**What a batch update actually is**: instead of calling `PutPrice` once per symbol — `PutPrice(AAPL, 150)`, then `PutPrice(NVDA, 800)`, two separate client calls — you call `BatchPutPrice([("AAPL", 150), ("NVDA", 800)])` **once**, and both writes are committed to the log **together, as a single log entry, atomically**: either both end up committed, or neither does (there's no state where a crash mid-flight leaves you with `AAPL` written and `NVDA` not, the way there could be if you'd made two independent `PutPrice` calls and the process died between them).
+
+**The two layers of batching — don't conflate them:**
+
+| | **Command batching** (`BatchPutPrice`) | **Network batching** (`_add_to_batch`/`_flush_pending_entries`, Step 5) |
+|---|---|---|
+| What it groups | Multiple *key-value writes* into one *log entry* | Multiple *log entries* into one round of *AppendEntries RPCs* |
+| Who triggers it | The client, explicitly, by calling `BatchPutPrice` instead of N `PutPrice` calls | The system, automatically, for *every* write regardless of which RPC created it |
+| Unit being reduced | Log entries (disk writes, replay-on-recovery cost) | Network round trips |
+| Visible to the client? | Yes — it's an API you choose to use | No — happens transparently whether you called `PutPrice` or `BatchPutPrice` |
+
+They compose, and it's worth seeing concretely how: say 10 separate `BatchPutPrice` calls arrive at the leader within the same `flush_interval` window (50ms by default), each with 5 ticker prices. Command batching means that's **10 log entries** (not 50 — each call's 5 prices collapse into 1 entry). Network batching then means those 10 log entries get sent to every follower in **1 `AppendEntries` RPC**, not 10. Two independent optimizations, stacking: 50 logical writes → 10 log entries → 1 network round trip per follower.
+
+**Advantages of command batching specifically** (beyond what network batching already gives you):
+- **Atomicity.** A batch is one log entry with one index — it commits or doesn't as a unit. Ten separate `PutPrice` calls have no such guarantee between each other, even if network batching happens to ship them together (network batching's atomicity, from `_flush_pending_entries`'s success/failure handling, is *per-entry*, not across the whole flushed group).
+- **Smaller log, faster recovery.** 1 entry instead of N means 1/N the disk writes for this data, and — since crash recovery replays entries one at a time — proportionally less to replay after a restart.
+- **Lower overhead per logical write.** Every log entry carries fixed costs (an index, a term, a `fsync`'d disk write, a place in the majority-commit accounting). Batching amortizes that fixed cost across N writes instead of paying it N times.
+
+**How it's actually wired, end to end** (mirrors `put_price` almost exactly — that's deliberate, see Part 5):
+
+1. **Client**: `kvctl.py batch-put-price "AAPL:150.0,NVDA:800.0"` parses the comma-separated pairs and calls the `BatchPutPrice` gRPC method with a `repeated TickerPrice` field (the message shape — `proto/client.proto`'s `BatchPutPriceRequest` — was defined back in Step 0 and never needed to change).
+2. **gRPC layer** (`server/grpc_server.py`'s `ClientService.BatchPutPrice`): converts the protobuf `TickerPrice` messages into `kv.state_machine.TickerPrice` dataclass instances, and calls `raft_node.batch_put_price(ticker_prices)`. This layer still does nothing but translate — same principle as Step 3.
+3. **`RaftNode.batch_put_price()`** (`raft/node.py`): checks leadership (same as `put_price`), then calls `serialize_batch_put_command(ticker_prices)` — **not** `serialize_put_command` N times — which wraps the *entire list* into one `Command(type="BATCH_PUT", data=[...])`, JSON-encodes it, and hands back **one** blob of bytes. That blob becomes the `command_bytes` of a **single** `LogEntry`, appended to the log **once**, and handed to `_add_to_batch` (the network-batching queue from Step 5) exactly like any other entry — `batch_put_price` doesn't need to know or care that network batching exists; it just produces one entry and lets the existing machinery replicate it, `await`ing the same per-entry future `put_price` uses for real confirmation.
+4. **State machine** (`kv/state_machine.py`'s `apply_command`): this is the part that required *no new code at all* — `apply_command` already had a `BATCH_PUT` branch (`elif command.type == "BATCH_PUT": for ticker_price in command.data: self.store[ticker_price.symbol] = ticker_price`) from the very first version of this file. It was written to handle this case from the start; it just had no way to ever *receive* a `BATCH_PUT` command, because nothing upstream of it ever produced one. **This is worth sitting with**: the bug wasn't "we don't know how to do batch updates" — the hard part (state machine semantics) was done. The gap was purely plumbing — the gRPC handler and the `RaftNode` method that should have called this were never written. A good reminder that "is the feature done" and "does every layer in the pipeline actually connect" are different questions.
+
 ---
 
 ## Part 5 — Design Decisions, Distilled
@@ -229,6 +258,7 @@ This is covered in depth in Part 6 and Part 7 — the short version: generating 
 | Snapshot + InstallSnapshot | Let the log grow forever | Bounded disk usage and bounded crash-recovery replay time. |
 | Generated `docker-compose.yml` | Hand-written | Eliminates copy-paste port/peer-list mistakes at any node count; regenerable if the count changes. |
 | Reads served from local state, no read-index protocol | Route all reads through the leader | Simpler, faster reads — at the cost of followers being able to serve stale data. A conscious, documented trade-off, not an oversight. |
+| `BatchPutPrice` = 1 log entry for N writes | N separate `PutPrice` calls (relying only on network batching to group them) | Atomicity across the whole group, smaller log, and no dependence on N writes happening to land in the same flush window. |
 
 ---
 
@@ -295,7 +325,7 @@ This is the most instructive bug in the project, because unit tests structurally
 
 Think of this as a pyramid, cheapest/fastest at the bottom, most expensive/realistic at the top. You need all of it — each layer catches a different *class* of bug.
 
-### Layer 1 — Unit tests (`tests/*.py`, pytest, ~3.7s for all 140)
+### Layer 1 — Unit tests (`tests/*.py`, pytest, ~3.7s for all 143)
 
 Run on every change, take seconds. Test one function's logic in isolation, with its dependencies (network, sometimes disk) mocked out — e.g. "given these `match_index` values, does `_update_commit_index` compute the right majority index?" or "does `handle_vote_request` correctly deny a vote when the term is stale?"
 
@@ -333,10 +363,11 @@ If you were rebuilding this from scratch, this is the order that actually works 
 6. **Wire election + storage + state machine together into `RaftNode`** (`raft/node.py`): the replication path (`AppendEntries` send/handle), commit-index advancement, crash recovery. *Checkpoint: with the network still mocked, a 3-node in-process cluster (`tests/test_replication.py`-equivalent) replicates a write to majority and applies it on all three; a follower with a conflicting log entry gets it correctly overwritten by the leader's version.*
 7. **Wire it to real gRPC** (`server/grpc_server.py`, `server/cluster_boot.py`, `server/main.py`). *Checkpoint: run 3 processes on localhost with different ports (no Docker yet), and drive them with a simple client script.*
 8. **Containerize and compose** (`ops/Dockerfile`, generated `ops/docker-compose.yml`). *Checkpoint: `docker compose up`, a leader gets elected, `kvctl.py put-price`/`get-price` works end-to-end across real containers.*
-9. **Add batching** — and build the future-based confirmation in from the start this time, now that you've read Part 6 bug #3. *Checkpoint: a `put_price` call genuinely waits for and reports the real replication outcome, verified by a test that makes replication fail and checking the client sees `ok=False`.*
-10. **Add snapshotting/compaction** (`InstallSnapshot`, `raft/storage.py`'s snapshot methods). *Checkpoint: force a snapshot at a tiny threshold, confirm the log actually shrinks, restart a node and confirm it recovers correctly from the snapshot rather than the (now-gone) old log entries.*
-11. **Add metrics/structured logging** — last, because they're observability, not correctness; nothing else should depend on them existing.
-12. **Scale up and actually run it live.** Generate a bigger cluster. Kill the leader. Write through the new one. Read from the farthest node. If something's wrong, it'll show up here, in a way no unit test could have told you — go back and re-read Part 7 if that surprises you.
-13. **Write the chaos tests last**, once you trust the happy path enough to be confident that a chaos test failure means something real broke, not that your test harness is unreliable.
+9. **Add (network) batching** — and build the future-based confirmation in from the start this time, now that you've read Part 6 bug #3. *Checkpoint: a `put_price` call genuinely waits for and reports the real replication outcome, verified by a test that makes replication fail and checking the client sees `ok=False`.*
+10. **Add command batching (`BatchPutPrice`)** while network batching is still fresh in mind — they're easy to conflate, so build them close together and make sure your own mental model keeps them straight (see Part 4 Step 8's table). Since the state machine's `apply_command` should already handle a multi-write command type generically (build that in at step 5, not as an afterthought), this step should mostly be plumbing: a serialize function that takes a list, one `RaftNode` method, one gRPC handler. *Checkpoint: a single `BatchPutPrice` call with N entries produces exactly one log entry (assert on log length before/after, not just that the data landed), and all N writes are visible after that one entry commits.*
+11. **Add snapshotting/compaction** (`InstallSnapshot`, `raft/storage.py`'s snapshot methods). *Checkpoint: force a snapshot at a tiny threshold, confirm the log actually shrinks, restart a node and confirm it recovers correctly from the snapshot rather than the (now-gone) old log entries.*
+12. **Add metrics/structured logging** — last, because they're observability, not correctness; nothing else should depend on them existing.
+13. **Scale up and actually run it live.** Generate a bigger cluster. Kill the leader. Write through the new one. Read from the farthest node. If something's wrong, it'll show up here, in a way no unit test could have told you — go back and re-read Part 7 if that surprises you.
+14. **Write the chaos tests last**, once you trust the happy path enough to be confident that a chaos test failure means something real broke, not that your test harness is unreliable.
 
-If you can walk through all 13 steps, verify each checkpoint, and understand *why* each one had to come before the next — you understand this project well enough to have built it.
+If you can walk through all 14 steps, verify each checkpoint, and understand *why* each one had to come before the next — you understand this project well enough to have built it.
