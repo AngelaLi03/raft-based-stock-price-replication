@@ -199,6 +199,20 @@ class KVStateMachine:
         """Get all entries in the store."""
         return self.store.copy()
     
+    def get_snapshot_data(self) -> Dict[str, Any]:
+        """Return current store contents in a form suitable for a Raft snapshot."""
+        return {k: v.to_dict() for k, v in self.store.items()}
+
+    def restore_from_snapshot(self, kv_state: Dict[str, Any], last_applied_index: int) -> None:
+        """
+        Replace current state with a snapshot's contents. Used during crash
+        recovery/startup to skip straight to the snapshot's coverage instead
+        of replaying the (now-compacted) log entries it represents.
+        """
+        self.store = {symbol: TickerPrice.from_dict(data) for symbol, data in kv_state.items()}
+        self.last_applied_index = last_applied_index
+        logger.info(f"Restored {len(self.store)} entries from snapshot (last_applied_index={last_applied_index})")
+
     def dump_state(self) -> Dict[str, Any]:
         """Dump current state for debugging."""
         return {

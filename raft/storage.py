@@ -32,10 +32,20 @@ class RaftStorage:
         self.node_id = node_id
         self.log_file = os.path.join(data_dir, f"{node_id}_raft_log.json")
         self.meta_file = os.path.join(data_dir, f"{node_id}_raft_meta.json")
-        
+        self.snapshot_file = os.path.join(data_dir, f"{node_id}_snapshot.json")
+
         # Ensure data directory exists
         os.makedirs(data_dir, exist_ok=True)
-        
+
+        # Snapshot coverage: entries with index <= last_included_index are
+        # compacted away and only available via the snapshot itself, not
+        # self.log. Must be loaded before _load_log() so index<->position
+        # math (see get_log_entry/truncate_log_from) is consistent from the
+        # start - self.log only ever holds entries *after* the snapshot.
+        self.last_included_index = 0
+        self.last_included_term = 0
+        self._load_snapshot_metadata()
+
         # Load existing data
         self._load_metadata()
         self._load_log()
@@ -63,6 +73,21 @@ class RaftStorage:
                 self.commit_index = 0
                 self.last_applied = 0
     
+    def _load_snapshot_metadata(self) -> None:
+        """Load just last_included_index/term from the snapshot file, if any."""
+        if os.path.exists(self.snapshot_file):
+            try:
+                with open(self.snapshot_file, 'r') as f:
+                    snap = json.load(f)
+                    self.last_included_index = snap.get("last_included_index", 0)
+                    self.last_included_term = snap.get("last_included_term", 0)
+                    logger.info(
+                        f"Found snapshot covering up to index {self.last_included_index} "
+                        f"(term {self.last_included_term})"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load snapshot metadata: {e}")
+
     def _load_log(self) -> None:
         """Load log entries from disk."""
         self.log: List[LogEntry] = []
@@ -148,33 +173,95 @@ class RaftStorage:
         return self.log.copy()
     
     def get_log_entry(self, index: int) -> Optional[LogEntry]:
-        """Get log entry at specific index (1-based)."""
-        if 1 <= index <= len(self.log):
-            return self.log[index - 1]
+        """
+        Get log entry at specific absolute index (1-based across the whole
+        log, including any compacted prefix). Returns None both for
+        out-of-range indices and for indices already covered by a snapshot -
+        callers needing snapshot-covered data should read the snapshot
+        instead (see get_last_log_info / load_snapshot).
+        """
+        pos = index - self.last_included_index - 1
+        if 0 <= pos < len(self.log):
+            return self.log[pos]
         return None
-    
+
     def get_last_log_index(self) -> int:
-        """Get the index of the last log entry (0 if empty)."""
-        return len(self.log)
-    
+        """Get the index of the last log entry (0 if empty and no snapshot)."""
+        return self.last_included_index + len(self.log)
+
     def get_last_log_term(self) -> int:
-        """Get the term of the last log entry (0 if empty)."""
+        """Get the term of the last log entry, falling back to the snapshot's
+        last_included_term if the log is empty (e.g. right after a snapshot
+        compacted everything, or on a freshly restored node)."""
         if self.log:
             return self.log[-1].term
-        return 0
-    
+        return self.last_included_term
+
     def append_entries(self, entries: List[LogEntry]) -> None:
         """Append new entries to the log."""
         self.log.extend(entries)
         self._save_log()
         logger.debug(f"Appended {len(entries)} entries to log")
-    
+
     def truncate_log_from(self, index: int) -> None:
-        """Truncate log from the given index (1-based)."""
-        if index <= len(self.log):
-            self.log = self.log[:index - 1]
+        """Truncate log from the given absolute index (1-based)."""
+        pos = index - self.last_included_index - 1
+        if pos < 0:
+            logger.error(
+                f"Refusing to truncate from index {index}: already covered by "
+                f"snapshot up to index {self.last_included_index}"
+            )
+            return
+        if pos <= len(self.log):
+            self.log = self.log[:pos]
             self._save_log()
             logger.debug(f"Truncated log from index {index}")
+
+    def save_snapshot(self, last_included_index: int, last_included_term: int,
+                       kv_state: dict) -> None:
+        """
+        Persist a snapshot covering all entries up to last_included_index,
+        then compact the log by discarding those entries (they're now fully
+        represented by the snapshot).
+        """
+        if last_included_index <= self.last_included_index:
+            logger.debug(
+                f"Skipping snapshot at {last_included_index}: already covered "
+                f"up to {self.last_included_index}"
+            )
+            return
+
+        snapshot = {
+            "last_included_index": last_included_index,
+            "last_included_term": last_included_term,
+            "kv_state": kv_state,
+            "timestamp": int(time.time())
+        }
+        self._atomic_write(self.snapshot_file, json.dumps(snapshot))
+
+        # Compact: keep only entries not yet covered by the new snapshot.
+        # Filtering on each entry's own .index (rather than positional slicing)
+        # is correct regardless of the previous snapshot offset.
+        self.log = [e for e in self.log if e.index > last_included_index]
+        self.last_included_index = last_included_index
+        self.last_included_term = last_included_term
+        self._save_log()
+
+        logger.info(
+            f"Snapshot saved at index {last_included_index} (term {last_included_term}), "
+            f"log compacted to {len(self.log)} entries"
+        )
+
+    def load_snapshot(self) -> Optional[dict]:
+        """Load the persisted snapshot, if any, for state machine restore."""
+        if not os.path.exists(self.snapshot_file):
+            return None
+        try:
+            with open(self.snapshot_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load snapshot: {e}")
+            return None
     
     def get_commit_index(self) -> int:
         """Get the commit index."""

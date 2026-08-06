@@ -53,6 +53,19 @@ class RaftService(raft_pb2_grpc.RaftServiceServicer):
             context.set_details(str(e))
             return raft_pb2.AppendEntriesResponse(term=0, success=False, match_index=0)
 
+    async def InstallSnapshot(self, request, context):
+        """Handle InstallSnapshot RPC."""
+        logger.debug(f"Received InstallSnapshot from {request.leader_id}")
+
+        try:
+            response = await self.raft_node.handle_install_snapshot(request)
+            return response
+        except Exception as e:
+            logger.error(f"Error handling InstallSnapshot: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return raft_pb2.InstallSnapshotResponse(term=0)
+
 
 class ClientService(client_pb2_grpc.ClientServiceServicer):
     """gRPC service implementation for Client API."""
@@ -311,6 +324,15 @@ class GrpcServer:
         # Set server references in raft node
         self.raft_node.raft_server = self.raft_server
         self.raft_node.client_server = self.client_server
+        
+        # Start metrics server
+        try:
+            from server.metrics_server import start_metrics_server
+            metrics_port = 8000 + int(self.raft_node.node_id.replace('node', ''))
+            await start_metrics_server(metrics_port)
+            logger.info(f"Metrics server started on port {metrics_port}")
+        except Exception as e:
+            logger.warning(f"Failed to start metrics server: {e}")
     
     async def stop(self) -> None:
         """Stop both gRPC servers."""

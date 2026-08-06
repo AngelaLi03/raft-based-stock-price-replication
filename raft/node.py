@@ -4,6 +4,7 @@ Main Raft node implementation.
 
 import asyncio
 import logging
+import os
 from typing import List, Optional, Dict, Any
 
 from .types import RaftState, PeerInfo, LogEntry
@@ -17,7 +18,8 @@ logger = logging.getLogger(__name__)
 class RaftNode:
     """Main Raft node implementation."""
     
-    def __init__(self, node_id: str, peers: List[PeerInfo], data_dir: str = "./data"):
+    def __init__(self, node_id: str, peers: List[PeerInfo], data_dir: str = "./data", 
+                 batch_size: int = None, flush_interval: int = None):
         """
         Initialize Raft node.
         
@@ -25,10 +27,21 @@ class RaftNode:
             node_id: Unique node identifier
             peers: List of peer nodes
             data_dir: Directory for persistent storage
+            batch_size: Number of entries per batch (default from types)
+            flush_interval: Flush interval in milliseconds (default from types)
         """
+        from .types import DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL, DEFAULT_SNAPSHOT_THRESHOLD
+
         self.node_id = node_id
         self.peers = peers
         self.data_dir = data_dir
+
+        # Batching configuration
+        self.batch_size = batch_size or int(os.environ.get('RAFT_BATCH_SIZE', DEFAULT_BATCH_SIZE))
+        self.flush_interval = flush_interval or int(os.environ.get('RAFT_FLUSH_INTERVAL_MS', DEFAULT_FLUSH_INTERVAL))
+
+        # Snapshot every N newly-applied committed entries
+        self.snapshot_threshold = int(os.environ.get('RAFT_SNAPSHOT_THRESHOLD', DEFAULT_SNAPSHOT_THRESHOLD))
         
         # Initialize storage
         self.storage = RaftStorage(data_dir, node_id)
@@ -38,10 +51,21 @@ class RaftNode:
         
         # Initialize metrics
         try:
-            from raft.metrics import init_metrics
-            init_metrics(node_id)
+            from raft.prometheus_metrics import init_prometheus_metrics
+            # Use different ports for each node to avoid conflicts
+            metrics_port = 8000 + int(node_id.replace('node', ''))
+            init_prometheus_metrics(node_id, metrics_port)
         except ImportError:
-            pass  # Metrics not available
+            logger.warning("Prometheus metrics not available")
+        
+        # Initialize structured logging
+        try:
+            from raft.structured_logging import get_structured_logger, setup_structured_logging
+            setup_structured_logging(node_id, use_json=True, log_level="INFO")
+            self.structured_logger = get_structured_logger("raft.node", node_id)
+        except ImportError:
+            logger.warning("Structured logging not available")
+            self.structured_logger = None
         
         # Initialize election manager
         self.election_manager = ElectionManager(
@@ -49,7 +73,8 @@ class RaftNode:
             peers=peers,
             request_vote_callback=self._request_vote_from_peer,
             become_leader_callback=self._on_become_leader,
-            become_follower_callback=self._on_become_follower
+            become_follower_callback=self._on_become_follower,
+            get_last_log_info_callback=self._get_last_log_info
         )
         
         # Current state
@@ -61,11 +86,17 @@ class RaftNode:
         self.next_index: Dict[str, int] = {}
         self.match_index: Dict[str, int] = {}
         
+        # Batching state
+        self.pending_entries: List[LogEntry] = []
+        self._pending_futures: Dict[int, asyncio.Future] = {}  # log index -> future resolved on flush
+        self.batch_flush_task: Optional[asyncio.Task] = None
+        self.batch_lock = asyncio.Lock()
+        
         # gRPC server references (set by server)
         self.raft_server = None
         self.client_server = None
         
-        logger.info(f"Raft node {node_id} initialized with {len(peers)} peers")
+        logger.info(f"Raft node {node_id} initialized with {len(peers)} peers (batch_size={self.batch_size}, flush_interval={self.flush_interval}ms)")
     
     async def start(self) -> None:
         """Start the Raft node with crash recovery."""
@@ -76,28 +107,49 @@ class RaftNode:
         self.election_manager.voted_for = self.storage.get_voted_for()
         self.commit_index = self.storage.get_commit_index()
         self.last_applied = self.storage.get_last_applied()
-        
-        # Ensure commit index doesn't exceed log length (in case of log truncation)
-        log_length = len(self.storage.get_log_entries())
-        if self.commit_index > log_length:
-            logger.warning(f"Commit index {self.commit_index} exceeds log length {log_length}, adjusting")
-            self.commit_index = log_length
+
+        # A snapshot's contents are, by construction, committed and applied -
+        # never let commit_index/last_applied fall behind what it covers
+        # (e.g. on a fresh data dir restored from a copied snapshot file).
+        if self.storage.last_included_index > self.commit_index:
+            self.commit_index = self.storage.last_included_index
             self.storage.set_commit_index(self.commit_index)
-        
+        if self.storage.last_included_index > self.last_applied:
+            self.last_applied = self.storage.last_included_index
+
+        # Ensure commit index doesn't exceed the log's real length (which is
+        # last_included_index + len(log) once a snapshot has compacted the
+        # log - NOT just len(log), which would undercount and wrongly roll
+        # back commit_index on a node with an active snapshot).
+        last_log_index = self.storage.get_last_log_index()
+        if self.commit_index > last_log_index:
+            logger.warning(f"Commit index {self.commit_index} exceeds log length {last_log_index}, adjusting")
+            self.commit_index = last_log_index
+            self.storage.set_commit_index(self.commit_index)
+
         # Ensure last_applied doesn't exceed commit_index
         if self.last_applied > self.commit_index:
             logger.warning(f"Last applied {self.last_applied} exceeds commit index {self.commit_index}, adjusting")
             self.last_applied = self.commit_index
             self.storage.set_last_applied(self.last_applied)
-        
+
         logger.info(f"Recovered state: term={self.election_manager.current_term}, commit_index={self.commit_index}, last_applied={self.last_applied}")
-        
-        # Start KV state machine
+
+        # Start KV state machine (loads its own periodically-persisted state)
         await self.kv_state_machine.start()
-        
+
+        # If a Raft snapshot exists and covers more than what the KV state
+        # machine's own (independently-scheduled) persistence last captured,
+        # it's the more authoritative source - restore from it instead.
+        raft_snapshot = self.storage.load_snapshot()
+        if raft_snapshot and raft_snapshot["last_included_index"] > self.kv_state_machine.last_applied_index:
+            self.kv_state_machine.restore_from_snapshot(
+                raft_snapshot["kv_state"], raft_snapshot["last_included_index"]
+            )
+
         # Synchronize KV state machine's last_applied_index with Raft node's last_applied
         self.kv_state_machine.last_applied_index = self.last_applied
-        
+
         # Replay any unapplied committed entries for crash recovery
         await self._recover_from_crash()
         
@@ -119,7 +171,11 @@ class RaftNode:
         
         logger.info(f"Raft node {self.node_id} stopped")
     
-    async def _request_vote_from_peer(self, peer_id: str, peer: PeerInfo, 
+    def _get_last_log_info(self) -> "tuple[int, int]":
+        """Return (last_log_index, last_log_term) for this node's own log."""
+        return self.storage.get_last_log_index(), self.storage.get_last_log_term()
+
+    async def _request_vote_from_peer(self, peer_id: str, peer: PeerInfo,
                                     term: int, last_log_index: int, last_log_term: int) -> Any:
         """
         Request vote from a peer via gRPC.
@@ -209,7 +265,54 @@ class RaftNode:
         except Exception as e:
             logger.warning(f"Failed to send append entries to {peer_id}: {e}")
             return None
-    
+
+    async def _send_install_snapshot_to_peer(self, peer: PeerInfo) -> None:
+        """
+        Send the full snapshot to a peer whose next_index has fallen behind
+        our compacted log - normal AppendEntries can't catch it up since
+        those entries no longer exist locally, only in the snapshot.
+        """
+        snapshot = self.storage.load_snapshot()
+        if not snapshot:
+            logger.warning(f"No snapshot available to install on {peer.node_id}")
+            return
+
+        try:
+            import json
+            from raft.proto import raft_pb2, raft_pb2_grpc
+            import grpc
+
+            channel = grpc.aio.insecure_channel(peer.raft_address)
+            stub = raft_pb2_grpc.RaftServiceStub(channel)
+
+            request = raft_pb2.InstallSnapshotRequest(
+                term=self.election_manager.current_term,
+                leader_id=self.node_id,
+                last_included_index=snapshot["last_included_index"],
+                last_included_term=snapshot["last_included_term"],
+                data=json.dumps(snapshot["kv_state"]).encode('utf-8')
+            )
+
+            response = await stub.InstallSnapshot(request)
+            await channel.close()
+
+            if not response:
+                return
+
+            if response.term > self.election_manager.current_term:
+                self.election_manager.current_term = response.term
+                self.election_manager.voted_for = None
+                await self._on_become_follower()
+                return
+
+            # Follower is now caught up through the snapshot boundary.
+            self.next_index[peer.node_id] = snapshot["last_included_index"] + 1
+            self.match_index[peer.node_id] = snapshot["last_included_index"]
+            logger.info(f"Installed snapshot on {peer.node_id} up to index {snapshot['last_included_index']}")
+
+        except Exception as e:
+            logger.warning(f"Failed to install snapshot on {peer.node_id}: {e}")
+
     async def _on_become_leader(self) -> None:
         """Called when this node becomes leader."""
         self.state = RaftState.LEADER
@@ -222,6 +325,28 @@ class RaftNode:
         
         # Start heartbeat task
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        
+        # Start batch flush task
+        await self._start_batch_flush_task()
+        
+        # Record leader change
+        try:
+            from raft.prometheus_metrics import record_leader_change, update_batch_size
+            record_leader_change()
+            update_batch_size(self.batch_size)
+        except ImportError:
+            pass
+        
+        # Structured logging
+        if self.structured_logger:
+            self.structured_logger.log_leader_change(
+                term=self.election_manager.current_term,
+                role=self.state.value,
+                commit_index=self.commit_index,
+                last_applied=self.last_applied,
+                log_length=self.storage.get_last_log_index(),
+                old_role="follower"
+            )
         
         logger.info(f"Node {self.node_id} became leader for term {self.election_manager.current_term}")
     
@@ -237,7 +362,124 @@ class RaftNode:
             except asyncio.CancelledError:
                 pass
         
+        # Stop batch flush task
+        await self._stop_batch_flush_task()
+
+        # Any writes still queued never got replicated as leader - fail them
+        # explicitly rather than leaving callers awaiting put_price() hanging.
+        async with self.batch_lock:
+            self.pending_entries.clear()
+            for future in self._pending_futures.values():
+                if not future.done():
+                    future.set_result(False)
+            self._pending_futures.clear()
+
         logger.info(f"Node {self.node_id} became follower")
+    
+    # Batching methods
+    
+    async def _start_batch_flush_task(self) -> None:
+        """Start the batch flush task for periodic flushing."""
+        if self.batch_flush_task and not self.batch_flush_task.done():
+            self.batch_flush_task.cancel()
+        
+        self.batch_flush_task = asyncio.create_task(self._batch_flush_loop())
+    
+    async def _stop_batch_flush_task(self) -> None:
+        """Stop the batch flush task."""
+        if self.batch_flush_task and not self.batch_flush_task.done():
+            self.batch_flush_task.cancel()
+            try:
+                await self.batch_flush_task
+            except asyncio.CancelledError:
+                pass
+    
+    async def _batch_flush_loop(self) -> None:
+        """Periodically flush pending entries."""
+        while self.state == RaftState.LEADER:
+            try:
+                await asyncio.sleep(self.flush_interval / 1000.0)
+                await self._flush_pending_entries()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in batch flush loop: {e}")
+                await asyncio.sleep(self.flush_interval / 1000.0)
+    
+    async def _add_to_batch(self, entry: LogEntry) -> asyncio.Future:
+        """
+        Add entry to pending batch and flush if needed.
+
+        Returns a future that resolves to True/False once this entry's batch
+        is actually flushed and replicated (or fails to be), so callers like
+        put_price can report the real outcome instead of an optimistic ack.
+        """
+        future = asyncio.get_running_loop().create_future()
+        async with self.batch_lock:
+            self.pending_entries.append(entry)
+            self._pending_futures[entry.index] = future
+
+            # Flush if batch is full
+            should_flush = len(self.pending_entries) >= self.batch_size
+
+        if should_flush:
+            await self._flush_pending_entries()
+
+        return future
+
+    async def _flush_pending_entries(self) -> None:
+        """Flush all pending entries to followers."""
+        async with self.batch_lock:
+            if not self.pending_entries:
+                return
+
+            entries_to_flush = self.pending_entries.copy()
+            self.pending_entries.clear()
+            futures_to_resolve = [self._pending_futures.pop(e.index, None) for e in entries_to_flush]
+
+        if entries_to_flush:
+            logger.info(f"Flushing batch of {len(entries_to_flush)} entries")
+            
+            # Record batch flush
+            try:
+                from raft.prometheus_metrics import record_batch_flush
+                record_batch_flush()
+            except ImportError:
+                pass
+            
+            # Time the batch flush
+            import time
+            start_time = time.time()
+            success = await self._replicate_to_peers(entries_to_flush)
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Structured logging
+            if self.structured_logger:
+                self.structured_logger.log_batch_flush(
+                    term=self.election_manager.current_term,
+                    role=self.state.value,
+                    commit_index=self.commit_index,
+                    last_applied=self.last_applied,
+                    log_length=self.storage.get_last_log_index(),
+                    batch_size=self.batch_size,
+                    entries_count=len(entries_to_flush),
+                    duration_ms=duration_ms
+                )
+            
+            if success:
+                # Update commit index and apply
+                await self._update_commit_index()
+                logger.info(f"Successfully replicated batch of {len(entries_to_flush)} entries")
+            else:
+                # Replication failed - remove entries from log, preserving everything
+                # before this batch (entries_to_flush are contiguous, appended together).
+                logger.warning(f"Batch replication failed for {len(entries_to_flush)} entries, removing from log")
+                self.storage.truncate_log_from(entries_to_flush[0].index)
+
+            # Let anyone awaiting these specific entries (e.g. put_price) know the outcome.
+            for future in futures_to_resolve:
+                if future is not None and not future.done():
+                    future.set_result(success)
     
     async def _recover_from_crash(self) -> None:
         """Recover from crash by replaying unapplied committed entries."""
@@ -277,16 +519,56 @@ class RaftNode:
     
     async def _apply_committed_entries(self) -> None:
         """Apply all committed entries that haven't been applied yet."""
+        applied_count = 0
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             entry = self.storage.get_log_entry(self.last_applied)
             if entry:
                 await self.kv_state_machine.apply_command(entry)
                 logger.debug(f"Applied entry {self.last_applied} to state machine")
+                applied_count += 1
+                
+                # Record command applied
+                try:
+                    from raft.prometheus_metrics import record_command_applied
+                    record_command_applied()
+                except ImportError:
+                    pass
             
             # Persist last_applied after each entry
             self.storage.set_last_applied(self.last_applied)
-    
+        
+        # Update KV entries count
+        if applied_count > 0:
+            try:
+                from raft.prometheus_metrics import update_kv_entries
+                kv_entries = len(self.kv_state_machine.dump_state().get("entries", {}))
+                update_kv_entries(kv_entries)
+            except ImportError:
+                pass
+
+        # Compact the log once enough entries have accumulated since the
+        # last snapshot, so it doesn't grow unbounded.
+        if self.last_applied - self.storage.last_included_index >= self.snapshot_threshold:
+            await self._take_snapshot()
+
+    async def _take_snapshot(self) -> None:
+        """Snapshot the state machine at last_applied and compact the log up to it."""
+        snapshot_index = self.last_applied
+        entry = self.storage.get_log_entry(snapshot_index)
+        snapshot_term = entry.term if entry else self.storage.get_last_log_term()
+
+        kv_state = self.kv_state_machine.get_snapshot_data()
+        self.storage.save_snapshot(snapshot_index, snapshot_term, kv_state)
+
+        try:
+            from raft.prometheus_metrics import record_snapshot
+            record_snapshot(snapshot_index)
+        except ImportError:
+            pass
+
+        logger.info(f"Took snapshot at index {snapshot_index} (term {snapshot_term})")
+
     async def _replicate_to_peers(self, entries: List[LogEntry]) -> bool:
         """
         Replicate entries to all peers and wait for majority acknowledgment.
@@ -299,6 +581,10 @@ class RaftNode:
         """
         if not entries:
             return True
+        
+        # Start timing replication
+        import time
+        start_time = time.time()
         
         # Send AppendEntries to all peers
         replication_tasks = []
@@ -315,9 +601,30 @@ class RaftNode:
             if isinstance(result, dict) and result.get("success", False):
                 successful_replications += 1
         
-        # Check if we have majority
-        majority = (len(self.peers) + 1) // 2 + 1  # +1 for self
-        return successful_replications >= majority
+        # Calculate duration and record metrics
+        duration_ms = (time.time() - start_time) * 1000
+        success = successful_replications >= ((len(self.peers) + 1) // 2 + 1)  # +1 for self
+        
+        try:
+            from raft.prometheus_metrics import record_replication
+            record_replication(len(entries), duration_ms, success)
+        except ImportError:
+            pass
+        
+        # Structured logging
+        if self.structured_logger:
+            self.structured_logger.log_replication(
+                term=self.election_manager.current_term,
+                role=self.state.value,
+                commit_index=self.commit_index,
+                last_applied=self.last_applied,
+                log_length=self.storage.get_last_log_index(),
+                entries_count=len(entries),
+                duration_ms=duration_ms,
+                success=success
+            )
+        
+        return success
     
     async def _send_append_entries_to_peer(self, peer: PeerInfo, entries: List[LogEntry]) -> Dict[str, Any]:
         """
@@ -346,6 +653,13 @@ class RaftNode:
                 prev_log_index, prev_log_term,
                 entries, self.commit_index
             )
+            
+            # Record AppendEntries sent
+            try:
+                from raft.prometheus_metrics import record_appendentries_sent
+                record_appendentries_sent(peer.node_id)
+            except ImportError:
+                pass
             
             if response and response.success:
                 # Update next_index and match_index
@@ -379,9 +693,20 @@ class RaftNode:
         if majority_index > self.commit_index:
             entry = self.storage.get_log_entry(majority_index)
             if entry and entry.term == self.election_manager.current_term:
+                old_commit_index = self.commit_index
                 self.commit_index = majority_index
                 self.storage.set_commit_index(self.commit_index)
                 logger.info(f"Updated commit index to {self.commit_index}")
+                
+                # Record commit metrics
+                try:
+                    from raft.prometheus_metrics import record_commit
+                    import time
+                    # Simple timing for commit operation
+                    commit_duration = 1.0  # Approximate
+                    record_commit(self.commit_index - old_commit_index, commit_duration)
+                except ImportError:
+                    pass
                 
                 # Apply newly committed entries
                 await self._apply_committed_entries()
@@ -462,7 +787,7 @@ class RaftNode:
         # Apply log entries
         if entries:
             # Truncate log if necessary (log matching property)
-            if request.prev_log_index < len(self.storage.get_log_entries()):
+            if request.prev_log_index < self.storage.get_last_log_index():
                 logger.info(f"Truncating log from index {request.prev_log_index + 1} for catch-up")
                 self.storage.truncate_log_from(request.prev_log_index + 1)
             
@@ -473,7 +798,7 @@ class RaftNode:
         # Update commit index
         if request.leader_commit > self.commit_index:
             old_commit_index = self.commit_index
-            self.commit_index = min(request.leader_commit, len(self.storage.get_log_entries()))
+            self.commit_index = min(request.leader_commit, self.storage.get_last_log_index())
             self.storage.set_commit_index(self.commit_index)
             
             if self.commit_index > old_commit_index:
@@ -486,7 +811,7 @@ class RaftNode:
         self.storage.set_current_term(self.election_manager.current_term)
         
         # Create response
-        current_log_length = len(self.storage.get_log_entries())
+        current_log_length = self.storage.get_last_log_index()
         response = raft_pb2.AppendEntriesResponse(
             term=self.election_manager.current_term,
             success=True,
@@ -495,7 +820,51 @@ class RaftNode:
         
         logger.debug(f"Append entries response: success=True, match_index={response.match_index}")
         return response
-    
+
+    async def handle_install_snapshot(self, request) -> Any:
+        """
+        Handle incoming InstallSnapshot RPC (follower side). The leader sends
+        this instead of AppendEntries when we've fallen far enough behind
+        that it no longer has the entries we'd need for normal catch-up.
+        """
+        import json
+        from raft.proto import raft_pb2
+
+        logger.info(f"Handling InstallSnapshot from {request.leader_id} up to index {request.last_included_index}")
+
+        if request.term < self.election_manager.current_term:
+            return raft_pb2.InstallSnapshotResponse(term=self.election_manager.current_term)
+
+        if request.term > self.election_manager.current_term:
+            self.election_manager.current_term = request.term
+            self.election_manager.voted_for = None
+            if self.state != RaftState.FOLLOWER:
+                await self._on_become_follower()
+
+        self.election_manager.start_election_timeout()
+
+        kv_state = json.loads(request.data.decode('utf-8'))
+
+        # Install the snapshot, then discard our entire local log rather
+        # than trying to preserve a matching suffix: anything we had is
+        # either already covered by the snapshot or may conflict with the
+        # leader's timeline, and replacing wholesale is simpler and still
+        # correct (the leader will just resend anything genuinely needed).
+        self.storage.save_snapshot(request.last_included_index, request.last_included_term, kv_state)
+        self.storage.truncate_log_from(request.last_included_index + 1)
+
+        self.kv_state_machine.restore_from_snapshot(kv_state, request.last_included_index)
+
+        self.commit_index = max(self.commit_index, request.last_included_index)
+        self.last_applied = request.last_included_index
+        self.storage.set_commit_index(self.commit_index)
+        self.storage.set_last_applied(self.last_applied)
+        self.storage.set_current_term(self.election_manager.current_term)
+
+        logger.info(f"Installed snapshot up to index {request.last_included_index} (term {request.last_included_term})")
+
+        return raft_pb2.InstallSnapshotResponse(term=self.election_manager.current_term)
+
     def _check_log_matching(self, prev_log_index: int, prev_log_term: int) -> bool:
         """
         Check if the log matches at the given index and term.
@@ -510,7 +879,7 @@ class RaftNode:
         if prev_log_index == 0:
             return True
         
-        if prev_log_index > len(self.storage.get_log_entries()):
+        if prev_log_index > self.storage.get_last_log_index():
             return False
         
         entry = self.storage.get_log_entry(prev_log_index)
@@ -525,6 +894,19 @@ class RaftNode:
         
         while self.state == RaftState.LEADER:
             try:
+                # Update node state metrics
+                try:
+                    from raft.prometheus_metrics import update_node_state
+                    log_length = self.storage.get_last_log_index()
+                    update_node_state(
+                        self.election_manager.current_term,
+                        self.commit_index,
+                        self.last_applied,
+                        log_length
+                    )
+                except ImportError:
+                    pass
+                
                 # Send heartbeats to all peers
                 heartbeat_tasks = []
                 for peer in self.peers:
@@ -547,6 +929,13 @@ class RaftNode:
     async def _send_heartbeat_to_peer(self, peer: PeerInfo) -> None:
         """Send heartbeat and catch up missing entries to a peer."""
         try:
+            # If this peer needs entries we've already compacted away, a
+            # normal AppendEntries can't catch it up (those entries no
+            # longer exist in our log) - send the snapshot instead.
+            if self.next_index[peer.node_id] <= self.storage.last_included_index:
+                await self._send_install_snapshot_to_peer(peer)
+                return
+
             # Get previous log entry info
             prev_log_index = self.next_index[peer.node_id] - 1
             prev_log_term = 0
@@ -557,7 +946,7 @@ class RaftNode:
             
             # Get entries to send (for catch-up)
             entries_to_send = []
-            current_log_length = len(self.storage.get_log_entries())
+            current_log_length = self.storage.get_last_log_index()
             if self.next_index[peer.node_id] <= current_log_length:
                 # Send missing entries for catch-up
                 for i in range(self.next_index[peer.node_id], current_log_length + 1):
@@ -580,6 +969,16 @@ class RaftNode:
                     self.next_index[peer.node_id] = len(entries_to_send) + self.next_index[peer.node_id]
                     self.match_index[peer.node_id] = self.next_index[peer.node_id] - 1
                     logger.info(f"Sent {len(entries_to_send)} entries to {peer.node_id} for catch-up")
+                    # A follower catching up here (rather than via the
+                    # synchronous batch-flush path - e.g. right after a
+                    # leader failover, when followers reconcile next_index
+                    # over several heartbeats) can push the cluster past
+                    # majority for entries the original flush's own
+                    # majority check missed. Re-check now, or that commit
+                    # only becomes visible whenever some *future* write
+                    # happens to re-trigger it - a real liveness gap,
+                    # found via live 15-node failover testing.
+                    await self._update_commit_index()
                 else:
                     self.match_index[peer.node_id] = prev_log_index
                     logger.debug(f"Sent heartbeat to {peer.node_id}")
@@ -638,29 +1037,19 @@ class RaftNode:
             self.storage.append_entries([entry])
             logger.info(f"Leader appended PutPrice: {symbol}={price} at index {log_index}")
             
-            # Replicate to followers
-            success = await self._replicate_to_peers([entry])
-            
-            if success:
-                # Update commit index and apply
-                await self._update_commit_index()
-                
-                return {
-                    "ok": True,
-                    "leader_hint": self.node_id,
-                    "error_message": None
-                }
-            else:
-                # Replication failed - remove the entry from log
-                logger.warning(f"Replication failed for entry {log_index}, removing from log")
-                self.storage.truncate_log(log_index - 1)
-                
-                return {
-                    "ok": False,
-                    "leader_hint": self.node_id,
-                    "error_message": "Failed to replicate to majority"
-                }
-                
+            # Add to batch for replication, and wait for that specific entry's
+            # batch to actually flush so we report the real outcome rather
+            # than an optimistic ack (batching still gives concurrent writers
+            # throughput - they just each wait on their own future).
+            flush_future = await self._add_to_batch(entry)
+            replicated = await flush_future
+
+            return {
+                "ok": replicated,
+                "leader_hint": self.node_id,
+                "error_message": None if replicated else "Replication failed"
+            }
+
         except Exception as e:
             logger.error(f"Error in PutPrice: {e}")
             return {
@@ -725,7 +1114,7 @@ class RaftNode:
                 "state": self.state.value,
                 "commit_index": self.commit_index,
                 "last_applied": self.last_applied,
-                "log_length": len(self.storage.get_log_entries()),
+                "log_length": self.storage.get_last_log_index(),
                 "kv_entries": len(kv_store.get("entries", {})),
                 "kv_store": kv_store.get("entries", {}),
                 "metrics": metrics
@@ -747,6 +1136,6 @@ class RaftNode:
             "voted_for": self.election_manager.voted_for,
             "commit_index": self.commit_index,
             "last_applied": self.last_applied,
-            "log_length": len(self.storage.get_log_entries()),
+            "log_length": self.storage.get_last_log_index(),
             "peers": [peer.node_id for peer in self.peers]
         }

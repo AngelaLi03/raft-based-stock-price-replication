@@ -141,7 +141,11 @@ async def test_put_price_as_leader(raft_node):
     # Make node leader
     raft_node.state = RaftState.LEADER
     raft_node.election_manager.current_term = 1
-    
+    # put_price now awaits its entry's batch flush; batch_size=1 makes that
+    # flush immediate so this test doesn't hang waiting on a timer that's
+    # never started (no _on_become_leader() call in this unit test).
+    raft_node.batch_size = 1
+
     # Initialize leader state
     for peer in raft_node.peers:
         raft_node.next_index[peer.node_id] = 1

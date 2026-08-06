@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""
+Chaos testing script for Raft cluster fault injection and recovery validation.
+"""
+
+import asyncio
+import argparse
+import logging
+import random
+import time
+import subprocess
+import sys
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+
+# Add project root to path
+sys.path.insert(0, '.')
+
+from scripts.kvctl import RaftClient
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChaosTestResult:
+    """Result of a chaos test."""
+    test_name: str
+    success: bool
+    duration_ms: float
+    error_message: Optional[str] = None
+    details: Dict[str, Any] = None
+
+
+class ChaosTester:
+    """Chaos testing orchestrator for Raft cluster."""
+    
+    def __init__(self, cluster_nodes: List[str] = None):
+        """
+        Initialize chaos tester.
+        
+        Args:
+            cluster_nodes: List of node addresses (host:port)
+        """
+        self.cluster_nodes = cluster_nodes or [
+            "localhost:50061",
+            "localhost:50062", 
+            "localhost:50063"
+        ]
+        self.clients: Dict[str, RaftClient] = {}
+        self.test_results: List[ChaosTestResult] = []
+        
+        # Initialize clients
+        for node in self.cluster_nodes:
+            host, port = node.split(':')
+            self.clients[node] = RaftClient(host, int(port))
+    
+    async def setup(self) -> None:
+        """Setup chaos testing environment."""
+        logger.info("Setting up chaos testing environment...")
+        
+        # Wait for cluster to be ready
+        await self._wait_for_cluster_ready()
+        
+        # Clear any existing data
+        await self._clear_cluster_data()
+        
+        logger.info("Chaos testing environment ready")
+    
+    async def cleanup(self) -> None:
+        """Cleanup after chaos testing."""
+        logger.info("Cleaning up chaos testing environment...")
+        
+        # Close all clients
+        for client in self.clients.values():
+            await client.close()
+        
+        logger.info("Chaos testing cleanup complete")
+    
+    async def _wait_for_cluster_ready(self, timeout: int = 30) -> None:
+        """Wait for cluster to be ready."""
+        logger.info("Waiting for cluster to be ready...")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Check if any node is responding
+                for node, client in self.clients.items():
+                    try:
+                        info = await client.get_cluster_info()
+                        if info:
+                            logger.info(f"Cluster ready, leader: {info.get('leader_id', 'unknown')}")
+                            return
+                    except Exception:
+                        continue
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning(f"Error waiting for cluster: {e}")
+                await asyncio.sleep(1)
+        
+        raise TimeoutError("Cluster not ready within timeout")
+    
+    async def _clear_cluster_data(self) -> None:
+        """Clear existing data from cluster."""
+        logger.info("Clearing cluster data...")
+        
+        # This would require implementing a clear/reset endpoint
+        # For now, we'll just log that we would clear data
+        logger.info("Cluster data cleared (placeholder)")
+    
+    async def _get_leader(self) -> Optional[str]:
+        """Get current leader node."""
+        for node, client in self.clients.items():
+            try:
+                info = await client.get_cluster_info()
+                if info and info.get('leader_id'):
+                    return node
+            except Exception:
+                continue
+        return None
+    
+    async def _write_test_data(self, count: int = 10) -> List[str]:
+        """Write test data to cluster."""
+        logger.info(f"Writing {count} test entries...")
+        
+        leader = await self._get_leader()
+        if not leader:
+            raise RuntimeError("No leader found")
+        
+        client = self.clients[leader]
+        written_keys = []
+        
+        for i in range(count):
+            key = f"chaos_test_{i}_{int(time.time())}"
+            price = random.uniform(100.0, 1000.0)
+            
+            try:
+                result = await client.put_price(key, price, int(time.time() * 1000))
+                if result and result.get('ok'):
+                    written_keys.append(key)
+                else:
+                    logger.warning(f"Failed to write {key}: {result}")
+            except Exception as e:
+                logger.warning(f"Error writing {key}: {e}")
+        
+        logger.info(f"Written {len(written_keys)} test entries")
+        return written_keys
+    
+    async def _verify_data_consistency(self, expected_keys: List[str]) -> bool:
+        """Verify data consistency across all nodes."""
+        logger.info("Verifying data consistency...")
+        
+        consistent = True
+        for node, client in self.clients.items():
+            try:
+                for key in expected_keys:
+                    result = await client.get_price(key)
+                    if not result or 'price' not in result:
+                        logger.error(f"Node {node} missing key {key}")
+                        consistent = False
+            except Exception as e:
+                logger.error(f"Error verifying node {node}: {e}")
+                consistent = False
+        
+        return consistent
+    
+    async def _stop_node(self, node: str) -> None:
+        """Stop a specific node."""
+        logger.info(f"Stopping node {node}")
+        
+        # Extract node number from address
+        node_num = node.split(':')[0].replace('localhost', '').replace('5006', '')
+        if not node_num:
+            node_num = '1'  # Default to node1
+        
+        try:
+            # Use docker compose to stop the node
+            subprocess.run([
+                'docker', 'compose', '-f', 'ops/docker-compose.yml', 
+                'stop', f'node{node_num}'
+            ], check=True, capture_output=True)
+            logger.info(f"Node {node} stopped successfully")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to stop node {node}: {e}")
+            raise
+    
+    async def _start_node(self, node: str) -> None:
+        """Start a specific node."""
+        logger.info(f"Starting node {node}")
+        
+        # Extract node number from address
+        node_num = node.split(':')[0].replace('localhost', '').replace('5006', '')
+        if not node_num:
+            node_num = '1'  # Default to node1
+        
+        try:
+            # Use docker compose to start the node
+            subprocess.run([
+                'docker', 'compose', '-f', 'ops/docker-compose.yml', 
+                'start', f'node{node_num}'
+            ], check=True, capture_output=True)
+            
+            # Wait for node to be ready
+            await asyncio.sleep(5)
+            logger.info(f"Node {node} started successfully")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to start node {node}: {e}")
+            raise
+    
+    async def test_leader_crash_recovery(self) -> ChaosTestResult:
+        """Test leader crash and recovery."""
+        test_name = "leader_crash_recovery"
+        logger.info(f"Running test: {test_name}")
+        
+        start_time = time.time()
+        
+        try:
+            # Write test data
+            test_keys = await self._write_test_data(5)
+            
+            # Get current leader
+            leader = await self._get_leader()
+            if not leader:
+                raise RuntimeError("No leader found")
+            
+            logger.info(f"Current leader: {leader}")
+            
+            # Stop leader
+            await self._stop_node(leader)
+            
+            # Wait for new leader election
+            await asyncio.sleep(10)
+            
+            # Write more data to new leader
+            new_test_keys = await self._write_test_data(3)
+            all_keys = test_keys + new_test_keys
+            
+            # Restart original leader
+            await self._start_node(leader)
+            
+            # Wait for catch-up
+            await asyncio.sleep(10)
+            
+            # Verify data consistency
+            consistent = await self._verify_data_consistency(all_keys)
+            
+            duration_ms = (time.time() - start_time) * 1000
+            
+            if consistent:
+                logger.info(f"Test {test_name} PASSED")
+                return ChaosTestResult(
+                    test_name=test_name,
+                    success=True,
+                    duration_ms=duration_ms,
+                    details={
+                        "original_leader": leader,
+                        "keys_written": len(all_keys),
+                        "data_consistent": consistent
+                    }
+                )
+            else:
+                logger.error(f"Test {test_name} FAILED - data inconsistency")
+                return ChaosTestResult(
+                    test_name=test_name,
+                    success=False,
+                    duration_ms=duration_ms,
+                    error_message="Data inconsistency detected",
+                    details={
+                        "original_leader": leader,
+                        "keys_written": len(all_keys),
+                        "data_consistent": consistent
+                    }
+                )
+                
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            logger.error(f"Test {test_name} FAILED with exception: {e}")
+            return ChaosTestResult(
+                test_name=test_name,
+                success=False,
+                duration_ms=duration_ms,
+                error_message=str(e)
+            )
+    
+    async def test_follower_catchup(self) -> ChaosTestResult:
+        """Test follower catch-up after restart."""
+        test_name = "follower_catchup"
+        logger.info(f"Running test: {test_name}")
+        
+        start_time = time.time()
+        
+        try:
+            # Get current leader
+            leader = await self._get_leader()
+            if not leader:
+                raise RuntimeError("No leader found")
+            
+            # Find a follower to stop
+            followers = [node for node in self.cluster_nodes if node != leader]
+            if not followers:
+                raise RuntimeError("No followers found")
+            
+            follower = random.choice(followers)
+            logger.info(f"Testing catch-up for follower: {follower}")
+            
+            # Stop follower
+            await self._stop_node(follower)
+            
+            # Write data while follower is down
+            test_keys = await self._write_test_data(5)
+            
+            # Restart follower
+            await self._start_node(follower)
+            
+            # Wait for catch-up
+            await asyncio.sleep(10)
+            
+            # Verify follower has the data
+            consistent = await self._verify_data_consistency(test_keys)
+            
+            duration_ms = (time.time() - start_time) * 1000
+            
+            if consistent:
+                logger.info(f"Test {test_name} PASSED")
+                return ChaosTestResult(
+                    test_name=test_name,
+                    success=True,
+                    duration_ms=duration_ms,
+                    details={
+                        "leader": leader,
+                        "follower": follower,
+                        "keys_written": len(test_keys),
+                        "data_consistent": consistent
+                    }
+                )
+            else:
+                logger.error(f"Test {test_name} FAILED - follower did not catch up")
+                return ChaosTestResult(
+                    test_name=test_name,
+                    success=False,
+                    duration_ms=duration_ms,
+                    error_message="Follower did not catch up",
+                    details={
+                        "leader": leader,
+                        "follower": follower,
+                        "keys_written": len(test_keys),
+                        "data_consistent": consistent
+                    }
+                )
+                
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            logger.error(f"Test {test_name} FAILED with exception: {e}")
+            return ChaosTestResult(
+                test_name=test_name,
+                success=False,
+                duration_ms=duration_ms,
+                error_message=str(e)
+            )
+    
+    async def test_concurrent_writes_during_leader_change(self) -> ChaosTestResult:
+        """Test concurrent writes during leader change."""
+        test_name = "concurrent_writes_during_leader_change"
+        logger.info(f"Running test: {test_name}")
+        
+        start_time = time.time()
+        
+        try:
+            # Start concurrent write tasks
+            write_tasks = []
+            for i in range(10):
+                task = asyncio.create_task(self._concurrent_write_worker(i))
+                write_tasks.append(task)
+            
+            # Wait a bit for writes to start
+            await asyncio.sleep(2)
+            
+            # Stop current leader to trigger election
+            leader = await self._get_leader()
+            if leader:
+                await self._stop_node(leader)
+                logger.info(f"Stopped leader {leader} to trigger election")
+            
+            # Wait for writes to complete
+            write_results = await asyncio.gather(*write_tasks, return_exceptions=True)
+            
+            # Count successful writes
+            successful_writes = sum(1 for result in write_results if isinstance(result, bool) and result)
+            
+            # Restart stopped leader
+            if leader:
+                await self._start_node(leader)
+                await asyncio.sleep(5)
+            
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Consider test successful if at least 50% of writes succeeded
+            success_rate = successful_writes / len(write_tasks)
+            success = success_rate >= 0.5
+            
+            if success:
+                logger.info(f"Test {test_name} PASSED (success rate: {success_rate:.2%})")
+            else:
+                logger.error(f"Test {test_name} FAILED (success rate: {success_rate:.2%})")
+            
+            return ChaosTestResult(
+                test_name=test_name,
+                success=success,
+                duration_ms=duration_ms,
+                details={
+                    "total_writes": len(write_tasks),
+                    "successful_writes": successful_writes,
+                    "success_rate": success_rate,
+                    "stopped_leader": leader
+                }
+            )
+                
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            logger.error(f"Test {test_name} FAILED with exception: {e}")
+            return ChaosTestResult(
+                test_name=test_name,
+                success=False,
+                duration_ms=duration_ms,
+                error_message=str(e)
+            )
+    
+    async def _concurrent_write_worker(self, worker_id: int) -> bool:
+        """Worker for concurrent writes."""
+        try:
+            leader = await self._get_leader()
+            if not leader:
+                return False
+            
+            client = self.clients[leader]
+            key = f"concurrent_test_{worker_id}_{int(time.time())}"
+            price = random.uniform(100.0, 1000.0)
+            
+            result = await client.put_price(key, price, int(time.time() * 1000))
+            return result and result.get('ok', False)
+            
+        except Exception as e:
+            logger.warning(f"Concurrent write worker {worker_id} failed: {e}")
+            return False
+    
+    async def run_all_tests(self) -> List[ChaosTestResult]:
+        """Run all chaos tests."""
+        logger.info("Starting chaos test suite...")
+        
+        tests = [
+            self.test_leader_crash_recovery,
+            self.test_follower_catchup,
+            self.test_concurrent_writes_during_leader_change
+        ]
+        
+        for test_func in tests:
+            try:
+                result = await test_func()
+                self.test_results.append(result)
+                
+                # Wait between tests
+                await asyncio.sleep(5)
+                
+            except Exception as e:
+                logger.error(f"Test {test_func.__name__} failed with exception: {e}")
+                self.test_results.append(ChaosTestResult(
+                    test_name=test_func.__name__,
+                    success=False,
+                    duration_ms=0,
+                    error_message=str(e)
+                ))
+        
+        return self.test_results
+    
+    def print_results(self) -> None:
+        """Print test results summary."""
+        print("\n" + "="*60)
+        print("CHAOS TEST RESULTS")
+        print("="*60)
+        
+        total_tests = len(self.test_results)
+        passed_tests = sum(1 for result in self.test_results if result.success)
+        failed_tests = total_tests - passed_tests
+        
+        print(f"Total Tests: {total_tests}")
+        print(f"Passed: {passed_tests}")
+        print(f"Failed: {failed_tests}")
+        print(f"Success Rate: {passed_tests/total_tests*100:.1f}%")
+        print()
+        
+        for result in self.test_results:
+            status = "PASS" if result.success else "FAIL"
+            print(f"{status:4} {result.test_name:35} ({result.duration_ms:.0f}ms)")
+            if not result.success and result.error_message:
+                print(f"      Error: {result.error_message}")
+            if result.details:
+                for key, value in result.details.items():
+                    print(f"      {key}: {value}")
+        
+        print("="*60)
+
+
+async def main():
+    """Main chaos testing function."""
+    parser = argparse.ArgumentParser(description="Chaos testing for Raft cluster")
+    parser.add_argument("--nodes", nargs="+", 
+                       default=["localhost:50061", "localhost:50062", "localhost:50063"],
+                       help="Cluster node addresses")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Enable verbose logging")
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create chaos tester
+    tester = ChaosTester(args.nodes)
+    
+    try:
+        # Setup
+        await tester.setup()
+        
+        # Run tests
+        results = await tester.run_all_tests()
+        
+        # Print results
+        tester.print_results()
+        
+        # Exit with error code if any tests failed
+        if any(not result.success for result in results):
+            sys.exit(1)
+            
+    except Exception as e:
+        logger.error(f"Chaos testing failed: {e}")
+        sys.exit(1)
+        
+    finally:
+        # Cleanup
+        await tester.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

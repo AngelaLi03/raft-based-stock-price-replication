@@ -140,16 +140,14 @@ async def test_append_entries_with_log_entries(raft_node):
     mock_entry.command_bytes = serialize_put_command("AAPL", 150.0, 1234567890)
     mock_request.entries = [mock_entry]
     
-    # Mock storage methods
+    # Spy on (rather than replace) append_entries so the real storage log
+    # actually grows - match_index is computed from the real post-append
+    # log length, so faking that separately would just drift out of sync
+    # with whatever append_entries actually does.
     raft_node.storage.set_current_term = MagicMock()
-    raft_node.storage.append_entries = MagicMock()
+    raft_node.storage.append_entries = MagicMock(wraps=raft_node.storage.append_entries)
     raft_node.storage.set_commit_index = MagicMock()
-    
-    # Mock log entries to return one entry after append
-    def mock_get_log_entries():
-        return [MagicMock()]  # Return one entry
-    raft_node.storage.get_log_entries = MagicMock(side_effect=mock_get_log_entries)
-    
+
     # Mock apply method
     raft_node._apply_committed_entries = AsyncMock()
     
@@ -207,34 +205,76 @@ async def test_append_entries_log_truncation(raft_node):
 
 @pytest.mark.asyncio
 async def test_put_price_replication(raft_node):
-    """Test PutPrice with log replication."""
+    """Test PutPrice with log replication.
+
+    PutPrice appends locally and enqueues the entry for batched replication
+    (see raft/node.py:_add_to_batch) rather than replicating synchronously.
+    With batch_size=1, a single write triggers an immediate flush, so this
+    still verifies a write reaches _replicate_to_peers end-to-end.
+    """
     # Make node leader
     raft_node.state = RaftState.LEADER
     raft_node.election_manager.current_term = 1
-    
+    raft_node.batch_size = 1
+
     # Initialize leader state
     for peer in raft_node.peers:
         raft_node.next_index[peer.node_id] = 1
         raft_node.match_index[peer.node_id] = 0
-    
+
     # Mock replication
     raft_node._replicate_to_peers = AsyncMock(return_value=True)
     raft_node._update_commit_index = AsyncMock()
-    
+
     # Mock storage
     raft_node.storage.get_last_log_index = MagicMock(return_value=0)
     raft_node.storage.append_entries = MagicMock()
-    
+
     # Test PutPrice
     result = await raft_node.put_price("AAPL", 150.0, 1234567890)
-    
+
     assert result["ok"] is True
     assert result["leader_hint"] == "node1"
     assert result["error_message"] is None
-    
-    # Verify replication was called
+
+    # Verify replication was called (via the batch flush triggered by batch_size=1)
     raft_node._replicate_to_peers.assert_called_once()
     raft_node._update_commit_index.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_put_price_waits_for_timer_based_flush(raft_node):
+    """
+    A write below batch_size doesn't flush immediately, but put_price still
+    waits for and reports the real outcome once the periodic flush loop
+    (started here, as _on_become_leader would in production) picks it up.
+    asyncio.wait_for guards against this hanging the suite if that contract
+    regresses.
+    """
+    raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 1
+    raft_node.batch_size = 5
+    raft_node.flush_interval = 10  # ms - fast flush for the test
+
+    for peer in raft_node.peers:
+        raft_node.next_index[peer.node_id] = 1
+        raft_node.match_index[peer.node_id] = 0
+
+    raft_node._replicate_to_peers = AsyncMock(return_value=True)
+    raft_node._update_commit_index = AsyncMock()
+    raft_node.storage.get_last_log_index = MagicMock(return_value=0)
+    raft_node.storage.append_entries = MagicMock()
+
+    await raft_node._start_batch_flush_task()
+    try:
+        result = await asyncio.wait_for(
+            raft_node.put_price("AAPL", 150.0, 1234567890), timeout=2
+        )
+    finally:
+        await raft_node._stop_batch_flush_task()
+
+    assert result["ok"] is True
+    raft_node._replicate_to_peers.assert_called_once()
 
 
 @pytest.mark.asyncio

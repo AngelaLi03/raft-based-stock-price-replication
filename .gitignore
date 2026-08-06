@@ -1,0 +1,14 @@
+# Virtual environments
+.venv/
+.venv*/
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# pytest
+.pytest_cache/
+
+# Raft node data directories (per-node logs, snapshots, KV state)
+data/

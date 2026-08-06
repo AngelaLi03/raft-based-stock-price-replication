@@ -1,20 +1,24 @@
-
 services:
   node1:
+    image: raft-node:latest
     build:
       context: ..
       dockerfile: ops/Dockerfile
     container_name: raft-node1
     environment:
       - NODE_ID=node1
-      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
       - RAFT_PORT=50051
-      - CLIENT_PORT=50061
+      - CLIENT_PORT=51051
       - DATA_DIR=/app/data
       - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
     ports:
       - "50051:50051"  # Raft port
-      - "50061:50061"  # Client port
+      - "51051:51051"  # Client port
+      - "8001:8001"  # Prometheus metrics
     volumes:
       - node1_data:/app/data
     networks:
@@ -22,20 +26,22 @@ services:
     restart: unless-stopped
 
   node2:
-    build:
-      context: ..
-      dockerfile: ops/Dockerfile
+    image: raft-node:latest
     container_name: raft-node2
     environment:
       - NODE_ID=node2
-      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
       - RAFT_PORT=50052
-      - CLIENT_PORT=50062
+      - CLIENT_PORT=51052
       - DATA_DIR=/app/data
       - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
     ports:
       - "50052:50052"  # Raft port
-      - "50062:50062"  # Client port
+      - "51052:51052"  # Client port
+      - "8002:8002"  # Prometheus metrics
     volumes:
       - node2_data:/app/data
     networks:
@@ -43,22 +49,300 @@ services:
     restart: unless-stopped
 
   node3:
-    build:
-      context: ..
-      dockerfile: ops/Dockerfile
+    image: raft-node:latest
     container_name: raft-node3
     environment:
       - NODE_ID=node3
-      - PEER_LIST=node1:node1:50051:50061,node2:node2:50052:50062,node3:node3:50053:50063
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
       - RAFT_PORT=50053
-      - CLIENT_PORT=50063
+      - CLIENT_PORT=51053
       - DATA_DIR=/app/data
       - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
     ports:
       - "50053:50053"  # Raft port
-      - "50063:50063"  # Client port
+      - "51053:51053"  # Client port
+      - "8003:8003"  # Prometheus metrics
     volumes:
       - node3_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node4:
+    image: raft-node:latest
+    container_name: raft-node4
+    environment:
+      - NODE_ID=node4
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50054
+      - CLIENT_PORT=51054
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50054:50054"  # Raft port
+      - "51054:51054"  # Client port
+      - "8004:8004"  # Prometheus metrics
+    volumes:
+      - node4_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node5:
+    image: raft-node:latest
+    container_name: raft-node5
+    environment:
+      - NODE_ID=node5
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50055
+      - CLIENT_PORT=51055
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50055:50055"  # Raft port
+      - "51055:51055"  # Client port
+      - "8005:8005"  # Prometheus metrics
+    volumes:
+      - node5_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node6:
+    image: raft-node:latest
+    container_name: raft-node6
+    environment:
+      - NODE_ID=node6
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50056
+      - CLIENT_PORT=51056
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50056:50056"  # Raft port
+      - "51056:51056"  # Client port
+      - "8006:8006"  # Prometheus metrics
+    volumes:
+      - node6_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node7:
+    image: raft-node:latest
+    container_name: raft-node7
+    environment:
+      - NODE_ID=node7
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50057
+      - CLIENT_PORT=51057
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50057:50057"  # Raft port
+      - "51057:51057"  # Client port
+      - "8007:8007"  # Prometheus metrics
+    volumes:
+      - node7_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node8:
+    image: raft-node:latest
+    container_name: raft-node8
+    environment:
+      - NODE_ID=node8
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50058
+      - CLIENT_PORT=51058
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50058:50058"  # Raft port
+      - "51058:51058"  # Client port
+      - "8008:8008"  # Prometheus metrics
+    volumes:
+      - node8_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node9:
+    image: raft-node:latest
+    container_name: raft-node9
+    environment:
+      - NODE_ID=node9
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50059
+      - CLIENT_PORT=51059
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50059:50059"  # Raft port
+      - "51059:51059"  # Client port
+      - "8009:8009"  # Prometheus metrics
+    volumes:
+      - node9_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node10:
+    image: raft-node:latest
+    container_name: raft-node10
+    environment:
+      - NODE_ID=node10
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50060
+      - CLIENT_PORT=51060
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50060:50060"  # Raft port
+      - "51060:51060"  # Client port
+      - "8010:8010"  # Prometheus metrics
+    volumes:
+      - node10_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node11:
+    image: raft-node:latest
+    container_name: raft-node11
+    environment:
+      - NODE_ID=node11
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50061
+      - CLIENT_PORT=51061
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50061:50061"  # Raft port
+      - "51061:51061"  # Client port
+      - "8011:8011"  # Prometheus metrics
+    volumes:
+      - node11_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node12:
+    image: raft-node:latest
+    container_name: raft-node12
+    environment:
+      - NODE_ID=node12
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50062
+      - CLIENT_PORT=51062
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50062:50062"  # Raft port
+      - "51062:51062"  # Client port
+      - "8012:8012"  # Prometheus metrics
+    volumes:
+      - node12_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node13:
+    image: raft-node:latest
+    container_name: raft-node13
+    environment:
+      - NODE_ID=node13
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50063
+      - CLIENT_PORT=51063
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50063:50063"  # Raft port
+      - "51063:51063"  # Client port
+      - "8013:8013"  # Prometheus metrics
+    volumes:
+      - node13_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node14:
+    image: raft-node:latest
+    container_name: raft-node14
+    environment:
+      - NODE_ID=node14
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50064
+      - CLIENT_PORT=51064
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50064:50064"  # Raft port
+      - "51064:51064"  # Client port
+      - "8014:8014"  # Prometheus metrics
+    volumes:
+      - node14_data:/app/data
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+  node15:
+    image: raft-node:latest
+    container_name: raft-node15
+    environment:
+      - NODE_ID=node15
+      - PEER_LIST=node1:node1:50051:51051,node2:node2:50052:51052,node3:node3:50053:51053,node4:node4:50054:51054,node5:node5:50055:51055,node6:node6:50056:51056,node7:node7:50057:51057,node8:node8:50058:51058,node9:node9:50059:51059,node10:node10:50060:51060,node11:node11:50061:51061,node12:node12:50062:51062,node13:node13:50063:51063,node14:node14:50064:51064,node15:node15:50065:51065
+      - RAFT_PORT=50065
+      - CLIENT_PORT=51065
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+      - RAFT_BATCH_SIZE=${RAFT_BATCH_SIZE:-10}
+      - RAFT_FLUSH_INTERVAL_MS=${RAFT_FLUSH_INTERVAL_MS:-50}
+      - RAFT_SNAPSHOT_THRESHOLD=${RAFT_SNAPSHOT_THRESHOLD:-50}
+    ports:
+      - "50065:50065"  # Raft port
+      - "51065:51065"  # Client port
+      - "8015:8015"  # Prometheus metrics
+    volumes:
+      - node15_data:/app/data
     networks:
       - raft-network
     restart: unless-stopped
@@ -67,6 +351,18 @@ volumes:
   node1_data:
   node2_data:
   node3_data:
+  node4_data:
+  node5_data:
+  node6_data:
+  node7_data:
+  node8_data:
+  node9_data:
+  node10_data:
+  node11_data:
+  node12_data:
+  node13_data:
+  node14_data:
+  node15_data:
 
 networks:
   raft-network:

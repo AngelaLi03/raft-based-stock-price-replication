@@ -65,6 +65,15 @@ ELECTION_TIMEOUT_MIN = 150  # milliseconds
 ELECTION_TIMEOUT_MAX = 300  # milliseconds
 HEARTBEAT_INTERVAL = 75     # milliseconds
 
+# Batching configuration
+DEFAULT_BATCH_SIZE = 10     # entries per batch
+DEFAULT_FLUSH_INTERVAL = 50 # milliseconds
+MAX_BATCH_SIZE = 100        # maximum entries per batch
+
+# Snapshotting: take a snapshot (and compact the log) every N newly-applied
+# committed entries.
+DEFAULT_SNAPSHOT_THRESHOLD = 50
+
 # Default ports
 DEFAULT_RAFT_PORT = 50051
 DEFAULT_CLIENT_PORT = 50061

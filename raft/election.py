@@ -5,7 +5,7 @@ Raft election logic and timeout handling.
 import asyncio
 import random
 import logging
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 
 from .types import RaftState, PeerInfo, ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
 
@@ -14,26 +14,32 @@ logger = logging.getLogger(__name__)
 
 class ElectionManager:
     """Manages Raft election timeouts and candidate behavior."""
-    
-    def __init__(self, node_id: str, peers: List[PeerInfo], 
+
+    def __init__(self, node_id: str, peers: List[PeerInfo],
                  request_vote_callback: Callable,
                  become_leader_callback: Callable,
-                 become_follower_callback: Callable):
+                 become_follower_callback: Callable,
+                 get_last_log_info_callback: Optional[Callable[[], Tuple[int, int]]] = None):
         """
         Initialize election manager.
-        
+
         Args:
             node_id: This node's ID
             peers: List of peer nodes
             request_vote_callback: Function to call when requesting votes
             become_leader_callback: Function to call when becoming leader
             become_follower_callback: Function to call when becoming follower
+            get_last_log_info_callback: Function returning (last_log_index, last_log_term)
+                for this node's own log. Used both to advertise this node's log state
+                when requesting votes, and to evaluate the log up-to-date check when
+                granting votes. Defaults to an empty log if not provided.
         """
         self.node_id = node_id
         self.peers = {peer.node_id: peer for peer in peers}
         self.request_vote_callback = request_vote_callback
         self.become_leader_callback = become_leader_callback
         self.become_follower_callback = become_follower_callback
+        self.get_last_log_info_callback = get_last_log_info_callback or (lambda: (0, 0))
         
         # Election state
         self.election_timeout_task: Optional[asyncio.Task] = None
@@ -131,10 +137,8 @@ class ElectionManager:
     async def _request_vote(self, peer_id: str, peer: PeerInfo) -> None:
         """Request vote from a peer."""
         try:
-            # Get last log index and term (for now, use dummy values)
-            last_log_index = 0  # TODO: Get from storage
-            last_log_term = 0   # TODO: Get from storage
-            
+            last_log_index, last_log_term = self.get_last_log_info_callback()
+
             logger.debug(f"Requesting vote from {peer_id}")
             
             # Call the request vote callback (implemented by RaftNode)
@@ -234,16 +238,32 @@ class ElectionManager:
                 asyncio.create_task(self._become_follower())
         
         # Grant vote if:
-        # 1. We haven't voted for anyone in this term, AND
+        # 1. We haven't voted for anyone else in this term, AND
         # 2. Candidate's log is at least as up-to-date as ours
-        if (self.voted_for is None or self.voted_for == candidate_id) and term >= self.current_term:
-            # TODO: Check log up-to-date condition
+        log_ok = self._is_log_up_to_date(last_log_index, last_log_term)
+
+        if (self.voted_for is None or self.voted_for == candidate_id) and term >= self.current_term and log_ok:
             self.voted_for = candidate_id
             logger.info(f"Granted vote to {candidate_id} for term {term}")
             return True
-        
-        logger.debug(f"Denied vote to {candidate_id}")
+
+        logger.debug(
+            f"Denied vote to {candidate_id}: log_ok={log_ok}, "
+            f"voted_for={self.voted_for}, term={term}, current_term={self.current_term}"
+        )
         return False
+
+    def _is_log_up_to_date(self, candidate_last_log_index: int, candidate_last_log_term: int) -> bool:
+        """
+        Raft's log up-to-date comparison (section 5.4.1 of the Raft paper):
+        the candidate's log is at least as up-to-date as ours if its last entry
+        has a higher term, or the same term with an index >= ours.
+        """
+        my_last_log_index, my_last_log_term = self.get_last_log_info_callback()
+
+        if candidate_last_log_term != my_last_log_term:
+            return candidate_last_log_term > my_last_log_term
+        return candidate_last_log_index >= my_last_log_index
     
     def handle_append_entries(self, term: int, leader_id: str, 
                             prev_log_index: int, prev_log_term: int,

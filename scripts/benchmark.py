@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+Benchmark script for Raft cluster performance testing.
+"""
+
+import asyncio
+import argparse
+import logging
+import time
+import statistics
+import sys
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import json
+
+# Add project root to path
+sys.path.insert(0, '.')
+
+from client.client import RaftClient
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BenchmarkResult:
+    """Result of a benchmark test."""
+    test_name: str
+    total_operations: int
+    successful_operations: int
+    failed_operations: int
+    duration_ms: float
+    throughput_ops_per_sec: float
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_p99_ms: float
+    latency_min_ms: float
+    latency_max_ms: float
+    error_rate: float
+
+
+class BenchmarkRunner:
+    """Benchmark runner for Raft cluster performance testing."""
+    
+    def __init__(self, cluster_nodes: List[str] = None):
+        """
+        Initialize benchmark runner.
+        
+        Args:
+            cluster_nodes: List of node addresses (host:port)
+        """
+        self.cluster_nodes = cluster_nodes or [
+            "localhost:50061",
+            "localhost:50062", 
+            "localhost:50063"
+        ]
+        self.clients: Dict[str, RaftClient] = {}
+        self.benchmark_results: List[BenchmarkResult] = []
+        
+        # Initialize clients
+        for node in self.cluster_nodes:
+            host, port = node.split(':')
+            self.clients[node] = RaftClient(host, int(port))
+    
+    async def setup(self) -> None:
+        """Setup benchmark environment."""
+        logger.info("Setting up benchmark environment...")
+        
+        # Wait for cluster to be ready
+        await self._wait_for_cluster_ready()
+        
+        # Clear any existing data
+        await self._clear_cluster_data()
+        
+        logger.info("Benchmark environment ready")
+    
+    async def cleanup(self) -> None:
+        """Cleanup after benchmarking."""
+        logger.info("Cleaning up benchmark environment...")
+        
+        # Close all clients
+        for client in self.clients.values():
+            await client.close()
+        
+        logger.info("Benchmark cleanup complete")
+    
+    async def _wait_for_cluster_ready(self, timeout: int = 30) -> None:
+        """Wait for cluster to be ready."""
+        logger.info("Waiting for cluster to be ready...")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Check if any node is responding
+                for node, client in self.clients.items():
+                    try:
+                        info = await client.get_cluster_info()
+                        if info:
+                            logger.info(f"Cluster ready, leader: {info.get('leader_id', 'unknown')}")
+                            return
+                    except Exception:
+                        continue
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning(f"Error waiting for cluster: {e}")
+                await asyncio.sleep(1)
+        
+        raise TimeoutError("Cluster not ready within timeout")
+    
+    async def _clear_cluster_data(self) -> None:
+        """Clear existing data from cluster."""
+        logger.info("Clearing cluster data...")
+        
+        # This would require implementing a clear/reset endpoint
+        # For now, we'll just log that we would clear data
+        logger.info("Cluster data cleared (placeholder)")
+    
+    async def _get_leader(self) -> Optional[str]:
+        """Get current leader node."""
+        for node, client in self.clients.items():
+            try:
+                info = await client.get_cluster_info()
+                if info and info.get('leader_id'):
+                    return node
+            except Exception:
+                continue
+        return None
+    
+    async def _write_operation(self, client: RaftClient, key: str, price: float) -> tuple[bool, float]:
+        """Perform a single write operation and return (success, latency_ms)."""
+        start_time = time.time()
+        
+        try:
+            result = await client.put_price(key, price, int(time.time() * 1000))
+            success = result and result.get('ok', False)
+            latency_ms = (time.time() - start_time) * 1000
+            return success, latency_ms
+        except Exception as e:
+            logger.warning(f"Write operation failed: {e}")
+            latency_ms = (time.time() - start_time) * 1000
+            return False, latency_ms
+    
+    async def _read_operation(self, client: RaftClient, key: str) -> tuple[bool, float]:
+        """Perform a single read operation and return (success, latency_ms)."""
+        start_time = time.time()
+        
+        try:
+            result = await client.get_price(key)
+            success = result and 'price' in result
+            latency_ms = (time.time() - start_time) * 1000
+            return success, latency_ms
+        except Exception as e:
+            logger.warning(f"Read operation failed: {e}")
+            latency_ms = (time.time() - start_time) * 1000
+            return False, latency_ms
+    
+    async def benchmark_writes(self, num_operations: int = 1000, 
+                             concurrency: int = 10) -> BenchmarkResult:
+        """Benchmark write operations."""
+        test_name = f"writes_{num_operations}_ops_{concurrency}_concurrent"
+        logger.info(f"Running benchmark: {test_name}")
+        
+        # Get leader
+        leader = await self._get_leader()
+        if not leader:
+            raise RuntimeError("No leader found")
+        
+        client = self.clients[leader]
+        
+        # Prepare operation data
+        operations = []
+        for i in range(num_operations):
+            key = f"benchmark_write_{i}_{int(time.time())}"
+            price = 100.0 + (i % 900)  # Prices from 100 to 1000
+            operations.append((key, price))
+        
+        # Run operations with concurrency
+        start_time = time.time()
+        
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def run_operation(op_data):
+            async with semaphore:
+                key, price = op_data
+                return await self._write_operation(client, key, price)
+        
+        # Execute all operations
+        results = await asyncio.gather(*[run_operation(op) for op in operations])
+        
+        end_time = time.time()
+        duration_ms = (end_time - start_time) * 1000
+        
+        # Analyze results
+        successful_ops = sum(1 for success, _ in results if success)
+        failed_ops = num_operations - successful_ops
+        latencies = [latency for _, latency in results]
+        
+        return self._create_benchmark_result(
+            test_name, num_operations, successful_ops, failed_ops,
+            duration_ms, latencies
+        )
+    
+    async def benchmark_reads(self, num_operations: int = 1000,
+                            concurrency: int = 10) -> BenchmarkResult:
+        """Benchmark read operations."""
+        test_name = f"reads_{num_operations}_ops_{concurrency}_concurrent"
+        logger.info(f"Running benchmark: {test_name}")
+        
+        # First, write some data to read
+        leader = await self._get_leader()
+        if not leader:
+            raise RuntimeError("No leader found")
+        
+        client = self.clients[leader]
+        
+        # Write test data
+        test_keys = []
+        for i in range(min(100, num_operations)):  # Write 100 unique keys
+            key = f"benchmark_read_{i}_{int(time.time())}"
+            price = 100.0 + (i % 900)
+            success, _ = await self._write_operation(client, key, price)
+            if success:
+                test_keys.append(key)
+        
+        if not test_keys:
+            raise RuntimeError("Failed to write test data for reads")
+        
+        # Prepare read operations (cycle through test keys)
+        operations = []
+        for i in range(num_operations):
+            key = test_keys[i % len(test_keys)]
+            operations.append(key)
+        
+        # Run read operations with concurrency
+        start_time = time.time()
+        
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def run_operation(key):
+            async with semaphore:
+                return await self._read_operation(client, key)
+        
+        # Execute all operations
+        results = await asyncio.gather(*[run_operation(key) for key in operations])
+        
+        end_time = time.time()
+        duration_ms = (end_time - start_time) * 1000
+        
+        # Analyze results
+        successful_ops = sum(1 for success, _ in results if success)
+        failed_ops = num_operations - successful_ops
+        latencies = [latency for _, latency in results]
+        
+        return self._create_benchmark_result(
+            test_name, num_operations, successful_ops, failed_ops,
+            duration_ms, latencies
+        )
+    
+    async def benchmark_mixed_workload(self, num_operations: int = 1000,
+                                     write_ratio: float = 0.5,
+                                     concurrency: int = 10) -> BenchmarkResult:
+        """Benchmark mixed read/write workload."""
+        test_name = f"mixed_{num_operations}_ops_{write_ratio:.1f}_write_ratio_{concurrency}_concurrent"
+        logger.info(f"Running benchmark: {test_name}")
+        
+        leader = await self._get_leader()
+        if not leader:
+            raise RuntimeError("No leader found")
+        
+        client = self.clients[leader]
+        
+        # Prepare operations
+        operations = []
+        for i in range(num_operations):
+            if i < int(num_operations * write_ratio):
+                # Write operation
+                key = f"benchmark_mixed_{i}_{int(time.time())}"
+                price = 100.0 + (i % 900)
+                operations.append(('write', key, price))
+            else:
+                # Read operation (use existing keys)
+                key = f"benchmark_mixed_{i % int(num_operations * write_ratio)}_{int(time.time())}"
+                operations.append(('read', key, None))
+        
+        # Run operations with concurrency
+        start_time = time.time()
+        
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def run_operation(op_data):
+            async with semaphore:
+                op_type, key, price = op_data
+                if op_type == 'write':
+                    return await self._write_operation(client, key, price)
+                else:
+                    return await self._read_operation(client, key)
+        
+        # Execute all operations
+        results = await asyncio.gather(*[run_operation(op) for op in operations])
+        
+        end_time = time.time()
+        duration_ms = (end_time - start_time) * 1000
+        
+        # Analyze results
+        successful_ops = sum(1 for success, _ in results if success)
+        failed_ops = num_operations - successful_ops
+        latencies = [latency for _, latency in results]
+        
+        return self._create_benchmark_result(
+            test_name, num_operations, successful_ops, failed_ops,
+            duration_ms, latencies
+        )
+    
+    def _create_benchmark_result(self, test_name: str, total_ops: int,
+                               successful_ops: int, failed_ops: int,
+                               duration_ms: float, latencies: List[float]) -> BenchmarkResult:
+        """Create a benchmark result from raw data."""
+        
+        # Calculate throughput
+        throughput = (successful_ops / duration_ms) * 1000 if duration_ms > 0 else 0
+        
+        # Calculate latency percentiles
+        if latencies:
+            latencies_sorted = sorted(latencies)
+            p50 = statistics.quantiles(latencies_sorted, n=2)[0]
+            p95 = statistics.quantiles(latencies_sorted, n=20)[18]  # 95th percentile
+            p99 = statistics.quantiles(latencies_sorted, n=100)[98]  # 99th percentile
+            min_latency = min(latencies)
+            max_latency = max(latencies)
+        else:
+            p50 = p95 = p99 = min_latency = max_latency = 0
+        
+        # Calculate error rate
+        error_rate = (failed_ops / total_ops) * 100 if total_ops > 0 else 0
+        
+        return BenchmarkResult(
+            test_name=test_name,
+            total_operations=total_ops,
+            successful_operations=successful_ops,
+            failed_operations=failed_ops,
+            duration_ms=duration_ms,
+            throughput_ops_per_sec=throughput,
+            latency_p50_ms=p50,
+            latency_p95_ms=p95,
+            latency_p99_ms=p99,
+            latency_min_ms=min_latency,
+            latency_max_ms=max_latency,
+            error_rate=error_rate
+        )
+    
+    async def run_all_benchmarks(self, num_operations: int = 1000,
+                               concurrency_levels: List[int] = None) -> List[BenchmarkResult]:
+        """Run all benchmark tests."""
+        if concurrency_levels is None:
+            concurrency_levels = [1, 5, 10, 20]
+        
+        logger.info("Starting benchmark suite...")
+        
+        # Write benchmarks
+        for concurrency in concurrency_levels:
+            result = await self.benchmark_writes(num_operations, concurrency)
+            self.benchmark_results.append(result)
+            await asyncio.sleep(2)  # Brief pause between tests
+        
+        # Read benchmarks
+        for concurrency in concurrency_levels:
+            result = await self.benchmark_reads(num_operations, concurrency)
+            self.benchmark_results.append(result)
+            await asyncio.sleep(2)
+        
+        # Mixed workload benchmarks
+        for concurrency in concurrency_levels:
+            result = await self.benchmark_mixed_workload(num_operations, 0.5, concurrency)
+            self.benchmark_results.append(result)
+            await asyncio.sleep(2)
+        
+        return self.benchmark_results
+    
+    def print_results(self) -> None:
+        """Print benchmark results summary."""
+        print("\n" + "="*100)
+        print("BENCHMARK RESULTS")
+        print("="*100)
+        
+        # Group results by test type
+        write_results = [r for r in self.benchmark_results if r.test_name.startswith('writes_')]
+        read_results = [r for r in self.benchmark_results if r.test_name.startswith('reads_')]
+        mixed_results = [r for r in self.benchmark_results if r.test_name.startswith('mixed_')]
+        
+        if write_results:
+            print("\nWRITE PERFORMANCE:")
+            print("-" * 80)
+            print(f"{'Concurrency':<12} {'Throughput':<12} {'P50 (ms)':<10} {'P95 (ms)':<10} {'P99 (ms)':<10} {'Error %':<8}")
+            print("-" * 80)
+            for result in write_results:
+                concurrency = result.test_name.split('_')[2]
+                print(f"{concurrency:<12} {result.throughput_ops_per_sec:<12.1f} "
+                      f"{result.latency_p50_ms:<10.2f} {result.latency_p95_ms:<10.2f} "
+                      f"{result.latency_p99_ms:<10.2f} {result.error_rate:<8.1f}")
+        
+        if read_results:
+            print("\nREAD PERFORMANCE:")
+            print("-" * 80)
+            print(f"{'Concurrency':<12} {'Throughput':<12} {'P50 (ms)':<10} {'P95 (ms)':<10} {'P99 (ms)':<10} {'Error %':<8}")
+            print("-" * 80)
+            for result in read_results:
+                concurrency = result.test_name.split('_')[2]
+                print(f"{concurrency:<12} {result.throughput_ops_per_sec:<12.1f} "
+                      f"{result.latency_p50_ms:<10.2f} {result.latency_p95_ms:<10.2f} "
+                      f"{result.latency_p99_ms:<10.2f} {result.error_rate:<8.1f}")
+        
+        if mixed_results:
+            print("\nMIXED WORKLOAD PERFORMANCE:")
+            print("-" * 80)
+            print(f"{'Concurrency':<12} {'Throughput':<12} {'P50 (ms)':<10} {'P95 (ms)':<10} {'P99 (ms)':<10} {'Error %':<8}")
+            print("-" * 80)
+            for result in mixed_results:
+                concurrency = result.test_name.split('_')[3]
+                print(f"{concurrency:<12} {result.throughput_ops_per_sec:<12.1f} "
+                      f"{result.latency_p50_ms:<10.2f} {result.latency_p95_ms:<10.2f} "
+                      f"{result.latency_p99_ms:<10.2f} {result.error_rate:<8.1f}")
+        
+        print("="*100)
+    
+    def save_results_json(self, filename: str = "benchmark_results.json") -> None:
+        """Save benchmark results to JSON file."""
+        results_data = []
+        for result in self.benchmark_results:
+            results_data.append({
+                "test_name": result.test_name,
+                "total_operations": result.total_operations,
+                "successful_operations": result.successful_operations,
+                "failed_operations": result.failed_operations,
+                "duration_ms": result.duration_ms,
+                "throughput_ops_per_sec": result.throughput_ops_per_sec,
+                "latency_p50_ms": result.latency_p50_ms,
+                "latency_p95_ms": result.latency_p95_ms,
+                "latency_p99_ms": result.latency_p99_ms,
+                "latency_min_ms": result.latency_min_ms,
+                "latency_max_ms": result.latency_max_ms,
+                "error_rate": result.error_rate
+            })
+        
+        with open(filename, 'w') as f:
+            json.dump(results_data, f, indent=2)
+        
+        logger.info(f"Benchmark results saved to {filename}")
+
+
+async def main():
+    """Main benchmark function."""
+    parser = argparse.ArgumentParser(description="Benchmark Raft cluster performance")
+    parser.add_argument("--nodes", nargs="+", 
+                       default=["localhost:50061", "localhost:50062", "localhost:50063"],
+                       help="Cluster node addresses")
+    parser.add_argument("--operations", "-n", type=int, default=1000,
+                       help="Number of operations per test")
+    parser.add_argument("--concurrency", "-c", nargs="+", type=int, default=[1, 5, 10, 20],
+                       help="Concurrency levels to test")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Enable verbose logging")
+    parser.add_argument("--output", "-o", default="benchmark_results.json",
+                       help="Output JSON file for results")
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create benchmark runner
+    runner = BenchmarkRunner(args.nodes)
+    
+    try:
+        # Setup
+        await runner.setup()
+        
+        # Run benchmarks
+        results = await runner.run_all_benchmarks(args.operations, args.concurrency)
+        
+        # Print results
+        runner.print_results()
+        
+        # Save results
+        runner.save_results_json(args.output)
+        
+    except Exception as e:
+        logger.error(f"Benchmarking failed: {e}")
+        sys.exit(1)
+        
+    finally:
+        # Cleanup
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
