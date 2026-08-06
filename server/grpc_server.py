@@ -219,26 +219,34 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
                         timestamp=ticker_price_dict["timestamp"]
                     ))
                 
-                # Convert metrics to protobuf format
+                # Convert metrics to protobuf format. The *_total fields are
+                # protobuf uint64 - prometheus_client's Counter/Gauge values
+                # are always stored (and returned by ._value.get()) as float
+                # internally regardless of what was recorded, so these need
+                # an explicit int() or protobuf raises "'float' object cannot
+                # be interpreted as an integer" (only surfaced by an actual
+                # dump-state call against live, recorded metrics - the old
+                # dead collector never had non-zero values to expose this).
                 metrics = None
                 if result.get("metrics"):
+                    m = result["metrics"]
                     metrics = client_pb2.RaftMetrics(
-                        elections_total=result["metrics"].get("elections_total", 0),
-                        election_duration_ms=result["metrics"].get("election_duration_ms", 0.0),
-                        entries_replicated_total=result["metrics"].get("entries_replicated_total", 0),
-                        replication_latency_ms=result["metrics"].get("replication_latency_ms", 0.0),
-                        replication_failures_total=result["metrics"].get("replication_failures_total", 0),
-                        commits_total=result["metrics"].get("commits_total", 0),
-                        commit_latency_ms=result["metrics"].get("commit_latency_ms", 0.0),
-                        crash_recoveries_total=result["metrics"].get("crash_recoveries_total", 0),
-                        replay_entries_total=result["metrics"].get("replay_entries_total", 0),
-                        snapshot_load_time_ms=result["metrics"].get("snapshot_load_time_ms", 0.0),
-                        catchup_latency_ms=result["metrics"].get("catchup_latency_ms", 0.0),
-                        log_entries_total=result["metrics"].get("log_entries_total", 0),
-                        storage_writes_total=result["metrics"].get("storage_writes_total", 0),
-                        storage_reads_total=result["metrics"].get("storage_reads_total", 0),
-                        commands_applied_total=result["metrics"].get("commands_applied_total", 0),
-                        kv_entries_total=result["metrics"].get("kv_entries_total", 0)
+                        elections_total=int(m.get("elections_total", 0)),
+                        election_duration_ms=m.get("election_duration_ms", 0.0),
+                        entries_replicated_total=int(m.get("entries_replicated_total", 0)),
+                        replication_latency_ms=m.get("replication_latency_ms", 0.0),
+                        replication_failures_total=int(m.get("replication_failures_total", 0)),
+                        commits_total=int(m.get("commits_total", 0)),
+                        commit_latency_ms=m.get("commit_latency_ms", 0.0),
+                        crash_recoveries_total=int(m.get("crash_recoveries_total", 0)),
+                        replay_entries_total=int(m.get("replay_entries_total", 0)),
+                        snapshot_load_time_ms=m.get("snapshot_load_time_ms", 0.0),
+                        catchup_latency_ms=m.get("catchup_latency_ms", 0.0),
+                        log_entries_total=int(m.get("log_entries_total", 0)),
+                        storage_writes_total=int(m.get("storage_writes_total", 0)),
+                        storage_reads_total=int(m.get("storage_reads_total", 0)),
+                        commands_applied_total=int(m.get("commands_applied_total", 0)),
+                        kv_entries_total=int(m.get("kv_entries_total", 0))
                     )
                 
                 response = client_pb2.DumpStateResponse(

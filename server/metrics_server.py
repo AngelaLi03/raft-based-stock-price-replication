@@ -42,7 +42,16 @@ class MetricsServer:
         logger.info("Metrics server stopped")
     
     async def handle_metrics(self, request: web_request.Request) -> web_response.Response:
-        """Handle /metrics endpoint."""
+        """Handle /metrics endpoint.
+
+        content_type intentionally omits ';charset=utf-8' - aiohttp's
+        Response rejects a charset embedded in content_type when text= is
+        also given (it wants to own that via a separate charset= kwarg, and
+        raises "charset must not be in content_type argument" otherwise). It
+        appends ';charset=utf-8' itself by default, producing the same final
+        header Prometheus expects. This only ever got exercised once this
+        server could actually bind its port - see README Known Issues.
+        """
         try:
             from raft.prometheus_metrics import get_prometheus_metrics
             metrics = get_prometheus_metrics()
@@ -50,18 +59,18 @@ class MetricsServer:
             if metrics:
                 return web.Response(
                     text=metrics.get_metrics(),
-                    content_type='text/plain; version=0.0.4; charset=utf-8'
+                    content_type='text/plain; version=0.0.4'
                 )
             else:
                 return web.Response(
                     text="# No metrics available\n",
-                    content_type='text/plain; version=0.0.4; charset=utf-8'
+                    content_type='text/plain; version=0.0.4'
                 )
         except Exception as e:
             logger.error(f"Error serving metrics: {e}")
             return web.Response(
                 text=f"# Error: {e}\n",
-                content_type='text/plain; version=0.0.4; charset=utf-8',
+                content_type='text/plain; version=0.0.4',
                 status=500
             )
     

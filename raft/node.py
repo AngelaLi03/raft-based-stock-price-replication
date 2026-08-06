@@ -508,7 +508,7 @@ class RaftNode:
                 # Record metrics
                 duration_ms = (time.time() - start_time) * 1000
                 try:
-                    from raft.metrics import record_crash_recovery
+                    from raft.prometheus_metrics import record_crash_recovery
                     record_crash_recovery(len(unapplied_entries), duration_ms)
                 except ImportError:
                     pass
@@ -1145,13 +1145,17 @@ class RaftNode:
             # Get KV store contents
             kv_store = self.kv_state_machine.dump_state()
             
-            # Get metrics if available
+            # Get metrics if available. Reads from the live Prometheus
+            # collector (the same one raft/prometheus_metrics.py updates on
+            # every election/replication/commit/etc.) - previously this read
+            # from the old raft/metrics.py collector, which nothing actually
+            # updated, so dump-state always showed zeros under real traffic.
             metrics = None
             try:
-                from raft.metrics import get_metrics
-                metrics_collector = get_metrics()
-                if metrics_collector:
-                    metrics = metrics_collector.get_metrics()
+                from raft.prometheus_metrics import get_prometheus_metrics
+                prometheus_metrics = get_prometheus_metrics()
+                if prometheus_metrics:
+                    metrics = prometheus_metrics.get_metrics_dict()
             except ImportError:
                 pass  # Metrics not available
             

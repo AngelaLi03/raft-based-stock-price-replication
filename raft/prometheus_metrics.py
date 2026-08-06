@@ -5,7 +5,7 @@ Prometheus metrics integration for Raft cluster observability.
 import time
 import logging
 from typing import Dict, Any, Optional
-from prometheus_client import Counter, Histogram, Gauge, start_http_server, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import CollectorRegistry
 
 logger = logging.getLogger(__name__)
@@ -211,12 +211,12 @@ class PrometheusMetrics:
             registry=self.registry
         )
 
-        # Start HTTP server for metrics
-        try:
-            start_http_server(self.port, registry=self.registry)
-            logger.info(f"Prometheus metrics server started on port {self.port}")
-        except Exception as e:
-            logger.warning(f"Failed to start Prometheus metrics server: {e}")
+        # No HTTP server started here - server/metrics_server.py serves this
+        # registry's /metrics (plus /health) on self.port instead. Starting
+        # one here too used to collide with that server binding the same
+        # port right after (the second bind failed silently, taking
+        # /health down with it even though /metrics still worked via
+        # whichever server won the race).
     
     def record_election(self, duration_ms: float) -> None:
         """Record an election event."""

@@ -13,7 +13,7 @@ Raft is the algorithm behind the consistency guarantees of systems like etcd (Ku
 - **Protocol Buffers** for wire format / service definitions (`proto/raft.proto`, `proto/client.proto`)
 - **Docker Compose** for local cluster orchestration (15-node by default, generated — see `scripts/gen_docker_compose.py`)
 - **Prometheus client** for metrics export (added in the in-progress Week 4 work)
-- **pytest** + `pytest-asyncio` for the test suite (143 tests, ~3,750 lines across 12 files)
+- **pytest** + `pytest-asyncio` for the test suite (148 tests, ~3,900 lines across 14 files)
 
 ## Concurrency Model
 
@@ -72,7 +72,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 - KV state machine (`kv/state_machine.py`) — in-memory store with periodic snapshotting, idempotent command application
 - `PutPrice` / `BatchPutPrice` / `GetPrice` / `GetClusterInfo` — implemented and replicated correctly
 - 15-node cluster (`scripts/gen_docker_compose.py --nodes N`), verified live via `docker compose up` — see "15-Node Verification" below
-- **Full test suite passes**: 143 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility
+- **Full test suite passes**: 148 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice + 5 for the gRPC/metrics-server layer, which had zero coverage before this session), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility
 
 ### Fixed this session
 1. **Leader-election safety gap** (was the single highest-priority correctness bug): vote granting now checks that the candidate's log is at least as up-to-date as the voter's before granting (`raft/election.py:_is_log_up_to_date`, implementing Raft §5.4.1), and candidates advertise their real `last_log_index`/`last_log_term` (from `RaftNode._get_last_log_info`, backed by storage) instead of hardcoded zeros.
@@ -85,15 +85,15 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 8. **8 real bugs in the "Week 4" test files themselves**, found while getting the suite to actually pass rather than just read as plausible: stale mocks that didn't reflect state changes made during the call under test (`test_follower_catchup_after_restart`), mocking the very method whose internal side effect was being asserted on (`test_metrics_recording_during_chaos`), wrong expected counts not matching the test's own setup (`test_crash_recovery_with_partial_commits`), `Histogram` metrics asserted via the `Counter`/`Gauge`-only `._value` API instead of `._sum` (5 assertions across `test_performance_metrics.py`), and an "isolation" test that compared two registries' exports before either had any recorded data (so they were trivially identical).
 9. **Commit index could get stuck after a leader failover** — found via live testing on the 15-node cluster, not by unit tests. `_update_commit_index()` was only ever called from the batch-flush path; a follower that instead caught up via the heartbeat path (the normal case right after a new leader takes over and has to reconcile `next_index` with everyone) never triggered a re-check. A write could return `ok=True`, replicate everywhere, and then sit uncommitted on the leader — invisible to some followers' reads — until some *later*, unrelated write happened to re-trigger the check and retroactively commit it. Reproduced live: killed the leader, wrote through the new one, and `GetPrice` on the farthest follower returned "not found" for a write the leader had already acked. Fixed by calling `_update_commit_index()` after heartbeat-driven catch-up too (`raft/node.py:_send_heartbeat_to_peer`); re-verified live afterward — commit index now advances immediately in the same scenario.
 10. **`BatchPutPrice` was a non-functional stub**: the gRPC handler returned `ok=True` without touching the request payload — batch writes silently did nothing, even though the KV state machine's `BATCH_PUT` apply logic was already correct and ready. Implemented `RaftNode.batch_put_price()` (mirrors `put_price`, but serializes the whole batch as a single log entry via `serialize_batch_put_command` rather than one entry per price), wired it through `ClientService.BatchPutPrice`, and added the `kvctl.py batch-put-price "SYM:PRICE,SYM:PRICE"` subcommand the README's own Quick Start had been implying worked all along.
+11. **Metrics were split across two disconnected systems, and the redundant one caused a port collision**: `raft/prometheus_metrics.py` started its own HTTP server on the metrics port *and* `server/metrics_server.py` (aiohttp) tried to bind the same port right after — the second bind failed silently, taking `/health` down with it. Meanwhile `dump-state` read from the old `raft/metrics.py` collector, which nothing had updated since the Prometheus-based rewrite, so it always showed 0s under real traffic. Fixed by removing the redundant `start_http_server()` call (`metrics_server.py` already serves this registry's `/metrics` plus `/health` on the same port — one server, not two), pointing `dump_state()` at the live `PrometheusMetrics.get_metrics_dict()` instead, and deleting `raft/metrics.py` entirely now that nothing referenced it. Verified live: `dump-state` shows real, non-zero counts after real writes.
+12. **Two more bugs the port collision had been hiding**, both only surfaced once `metrics_server.py` could actually bind and receive real requests for the first time: (a) `dump-state`'s protobuf conversion crashed with `'float' object cannot be interpreted as an integer` — `prometheus_client`'s `Counter`/`Gauge` values are always Python floats internally regardless of what was recorded, and assigning one into a protobuf `uint64` field raises. Fixed with explicit `int(...)` on every `*_total` field in `server/grpc_server.py`'s `DumpState`. (b) `/metrics` returned HTTP 500 — aiohttp's `web.Response` rejects a charset embedded inside `content_type` when `text=` is also given (`'charset must not be in content_type argument'`); fixed by dropping the embedded `;charset=utf-8` and letting aiohttp append it automatically. Neither had any test coverage before this session — added `tests/test_grpc_server.py` and `tests/test_metrics_server.py`, the first tests either file has ever had.
 
 ### Known issues still open
-1. **Metrics HTTP port collision**: `raft/prometheus_metrics.py` starts its own HTTP server on the metrics port, and `server/metrics_server.py` (aiohttp) tries to bind the same port — the second bind fails silently, making `metrics_server.py`'s `/health` endpoint unreachable as currently wired.
-2. **Two disconnected metrics systems**: the old `raft/metrics.py` collector (still used by `dump-state`) isn't updated by the new Prometheus-based code path — `kvctl.py dump-state` will show 0 for elections/commits/replication even under real traffic.
-3. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
-4. **`scripts/benchmark.py` can't run**: imports `from client.client import RaftClient`, but that module doesn't exist — the only real client implementation lives inside `scripts/kvctl.py`.
-5. **`scripts/chaos_test.py` always targets `node1`**: its node-name parsing logic (`_stop_node`/`_start_node`) reduces any `localhost:PORT` address to an empty string and falls back to a hardcoded default, so it doesn't actually stop the node it claims to. It also calls a `close()` method that `RaftClient` doesn't have, which will raise during cleanup.
-6. Minor: `MAX_BATCH_SIZE` is defined in `raft/types.py` but never referenced; `ElectionManager.handle_append_entries` (`election.py:248`) is dead code — the real path is `RaftNode.handle_append_entries`. `InstallSnapshot`'s follower-side implementation always replaces the whole local log rather than trying to preserve a matching suffix (correct, per the Raft paper's simpler allowed option — just not the most bandwidth-efficient one).
-7. **Leader's own `current_term` isn't persisted to storage when it wins an election** — only followers persist term via `handle_request_vote`/`handle_append_entries`. A candidate's in-memory term bump (`ElectionManager._start_election`) and the transition to leader (`RaftNode._on_become_leader`) never call `storage.set_current_term(...)`. Found while diagnosing the commit-index bug above (a leader's on-disk metadata showed a stale term while its live state was already ahead) — didn't end up being the cause of that bug, but it's a real durability gap: if a leader crashes right after winning an election, it can come back up believing an earlier term than it was actually in.
+1. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
+2. **`scripts/benchmark.py` can't run**: imports `from client.client import RaftClient`, but that module doesn't exist — the only real client implementation lives inside `scripts/kvctl.py`.
+3. **`scripts/chaos_test.py` always targets `node1`**: its node-name parsing logic (`_stop_node`/`_start_node`) reduces any `localhost:PORT` address to an empty string and falls back to a hardcoded default, so it doesn't actually stop the node it claims to. It also calls a `close()` method that `RaftClient` doesn't have, which will raise during cleanup.
+4. Minor: `MAX_BATCH_SIZE` is defined in `raft/types.py` but never referenced; `ElectionManager.handle_append_entries` (`election.py:248`) is dead code — the real path is `RaftNode.handle_append_entries`. `InstallSnapshot`'s follower-side implementation always replaces the whole local log rather than trying to preserve a matching suffix (correct, per the Raft paper's simpler allowed option — just not the most bandwidth-efficient one).
+5. **Leader's own `current_term` isn't persisted to storage when it wins an election** — only followers persist term via `handle_request_vote`/`handle_append_entries`. A candidate's in-memory term bump (`ElectionManager._start_election`) and the transition to leader (`RaftNode._on_become_leader`) never call `storage.set_current_term(...)`. Found while diagnosing the commit-index bug above (a leader's on-disk metadata showed a stale term while its live state was already ahead) — didn't end up being the cause of that bug, but it's a real durability gap: if a leader crashes right after winning an election, it can come back up believing an earlier term than it was actually in.
 
 ## 15-Node Verification
 
@@ -129,7 +129,7 @@ bash scripts/gen_protos.sh
 PYTHONPATH=. pytest tests/ -v
 ```
 
-143 tests, ~4.4s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+148 tests, ~4.5s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
 
 ## Running the Cluster
 
@@ -145,7 +145,7 @@ cd ..
 
 # 3. Give leader election a couple seconds, then check who won. Followers
 #    only report their own role (not who the leader is - see Known Issue
-#    #3), so check a few nodes. Client ports run 51051-51065 for a 15-node
+#    #1), so check a few nodes. Client ports run 51051-51065 for a 15-node
 #    cluster (node N's client port is 51050+N).
 PYTHONPATH=. python3 scripts/kvctl.py cluster-info --host localhost --port 51051
 
@@ -199,11 +199,11 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 ## API Reference
 
 ### Client Service (external, `proto/client.proto`)
-- `PutPrice(symbol, price, timestamp)` → `{ok, leader_hint}` — working; `leader_hint` is currently always empty (Known Issue #3)
+- `PutPrice(symbol, price, timestamp)` → `{ok, leader_hint}` — working; `leader_hint` is currently always empty (Known Issue #1)
 - `BatchPutPrice(entries[])` → `{ok, leader_hint}` — working, replicated as a single log entry
 - `GetPrice(symbol)` → `TickerPrice` — working
 - `GetClusterInfo()` → `{leader_id, term, members[], node_id, role}` — working
-- `DumpState()` → `{node_state, kv_store, metrics}` — working, but `metrics` reads from the stale collector (Known Issue #2)
+- `DumpState()` → `{node_state, kv_store, metrics}` — working, reads live metrics from the Prometheus collector
 
 ### Raft Service (internal, `proto/raft.proto`)
 - `RequestVote(term, candidate_id, last_log_index, last_log_term)` → `{term, vote_granted}`
@@ -222,8 +222,7 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 │   ├── election.py            # Leader election / heartbeat timers
 │   ├── storage.py             # Durable log + metadata storage, snapshot save/load, compaction
 │   ├── types.py                # Enums, dataclasses, constants
-│   ├── metrics.py             # Legacy in-process metrics collector (used by dump-state)
-│   ├── prometheus_metrics.py  # New Prometheus-based metrics (uncommitted)
+│   ├── prometheus_metrics.py  # Metrics (single source of truth - dump-state reads this too)
 │   └── structured_logging.py  # JSON structured logging (uncommitted)
 ├── kv/                        # Key-value state machine
 │   └── state_machine.py       # KV store, snapshot export/restore, command application (types live here too)
@@ -238,7 +237,7 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 │   ├── gen_docker_compose.py   # Generates ops/docker-compose.yml for N nodes
 │   ├── benchmark.py            # Load benchmark (uncommitted; broken import, see Known Issues)
 │   └── chaos_test.py           # Container-level chaos scenarios (uncommitted; node-targeting bug)
-├── tests/                      # 12 files, ~3,750 lines, 143 tests, all passing
+├── tests/                      # 14 files, ~3,900 lines, 148 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
 └── README.md
 ```
@@ -267,8 +266,8 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 6. ~~Scale to a 15-node cluster and verify election/heartbeat/replication still hold at that fan-out~~ — done
 7. ~~Implement log snapshotting/compaction so the log doesn't grow unbounded~~ — done
 8. ~~Implement `BatchPutPrice` server-side + `kvctl.py batch-put-price`~~ — done
-9. Resolve the metrics port collision and unify the two metrics collectors so `dump-state` reflects reality (Known Issues #1, #2)
-10. Fix `scripts/benchmark.py`'s broken import and `scripts/chaos_test.py`'s node-targeting bug (Known Issues #4, #5)
+9. ~~Resolve the metrics port collision and unify the two metrics collectors so `dump-state` reflects reality~~ — done
+10. Fix `scripts/benchmark.py`'s broken import and `scripts/chaos_test.py`'s node-targeting bug (Known Issues #2, #3)
 11. ~~Commit all of the above as real, reviewed commits~~ — done (Week 4 is now in git history)
 
 ## Future Roadmap (not started)
