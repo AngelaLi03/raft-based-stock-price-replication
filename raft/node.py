@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 from .types import RaftState, PeerInfo, LogEntry
 from .storage import RaftStorage
 from .election import ElectionManager
-from kv.state_machine import KVStateMachine, serialize_put_command, serialize_batch_put_command
+from kv.state_machine import KVStateMachine, TickerPrice, serialize_put_command, serialize_batch_put_command
 
 logger = logging.getLogger(__name__)
 
@@ -1057,7 +1057,55 @@ class RaftNode:
                 "leader_hint": self.node_id,
                 "error_message": str(e)
             }
-    
+
+    async def batch_put_price(self, ticker_prices: List[TickerPrice]) -> Dict[str, Any]:
+        """
+        Handle BatchPutPrice request.
+        Only leader accepts writes. The whole batch is appended and
+        replicated as a single log entry (BATCH_PUT command) rather than
+        one entry per price - kv/state_machine.py already applies a
+        BATCH_PUT atomically to all included symbols.
+        """
+        if self.state != RaftState.LEADER:
+            return {
+                "ok": False,
+                "leader_hint": None,
+                "error_message": "Not leader"
+            }
+
+        try:
+            command_bytes = serialize_batch_put_command(ticker_prices)
+
+            log_index = self.storage.get_last_log_index() + 1
+            entry = LogEntry(
+                index=log_index,
+                term=self.election_manager.current_term,
+                command_bytes=command_bytes
+            )
+
+            self.storage.append_entries([entry])
+            logger.info(f"Leader appended BatchPutPrice: {len(ticker_prices)} entries at index {log_index}")
+
+            # Same real-confirmation behavior as put_price - see fix #3 in
+            # README's "Fixed this session": don't ack until the batch
+            # containing this entry has actually flushed and replicated.
+            flush_future = await self._add_to_batch(entry)
+            replicated = await flush_future
+
+            return {
+                "ok": replicated,
+                "leader_hint": self.node_id,
+                "error_message": None if replicated else "Replication failed"
+            }
+
+        except Exception as e:
+            logger.error(f"Error in BatchPutPrice: {e}")
+            return {
+                "ok": False,
+                "leader_hint": self.node_id,
+                "error_message": str(e)
+            }
+
     async def get_price(self, symbol: str) -> Dict[str, Any]:
         """
         Handle GetPrice request.

@@ -82,6 +82,37 @@ class RaftClient:
             logger.error(f"Failed to put price: {e}")
             return None
     
+    async def batch_put_price(self, prices: list) -> Optional[dict]:
+        """Put multiple stock prices in a single replicated log entry.
+
+        Args:
+            prices: list of (symbol, price) tuples
+        """
+        import time
+        timestamp = int(time.time() * 1000)
+
+        try:
+            async with grpc.aio.insecure_channel(self.address) as channel:
+                stub = client_pb2_grpc.ClientServiceStub(channel)
+
+                ticker_prices = [
+                    client_pb2.TickerPrice(symbol=symbol, price=price, timestamp=timestamp)
+                    for symbol, price in prices
+                ]
+
+                request = client_pb2.BatchPutPriceRequest(ticker_prices=ticker_prices)
+                response = await stub.BatchPutPrice(request)
+
+                return {
+                    "ok": response.ok,
+                    "leader_hint": response.leader_hint,
+                    "error_message": response.error_message
+                }
+
+        except Exception as e:
+            logger.error(f"Failed to batch put prices: {e}")
+            return None
+
     async def get_price(self, symbol: str) -> Optional[dict]:
         """Get a stock price."""
         try:
@@ -198,6 +229,36 @@ async def cmd_put_price(args):
     return 0
 
 
+async def cmd_batch_put_price(args):
+    """Handle batch-put-price command."""
+    client = RaftClient(args.host, args.port)
+
+    try:
+        prices = []
+        for pair in args.entries.split(","):
+            symbol, price = pair.split(":")
+            prices.append((symbol.strip(), float(price)))
+    except ValueError:
+        print(f"Invalid entries format: {args.entries!r} - expected \"SYMBOL:PRICE,SYMBOL:PRICE,...\"")
+        return 1
+
+    print(f"Batch putting {len(prices)} prices to {client.address}...")
+
+    result = await client.batch_put_price(prices)
+    if result is None:
+        print("Failed to batch put prices")
+        return 1
+
+    if result["ok"]:
+        print(f"Successfully put {len(prices)} prices: {', '.join(f'{s}={p}' for s, p in prices)}")
+    else:
+        print(f"Failed to batch put prices: {result['error_message']}")
+        if result["leader_hint"]:
+            print(f"Try connecting to leader: {result['leader_hint']}")
+
+    return 0
+
+
 async def cmd_get_price(args):
     """Handle get-price command."""
     client = RaftClient(args.host, args.port)
@@ -280,6 +341,12 @@ def main():
     put_price_parser.add_argument("symbol", help="Stock symbol (e.g., AAPL)")
     put_price_parser.add_argument("price", type=float, help="Stock price")
     
+    # batch-put-price command
+    batch_put_price_parser = subparsers.add_parser("batch-put-price", help="Put multiple stock prices in one replicated entry")
+    batch_put_price_parser.add_argument("--host", default="localhost", help="Server hostname")
+    batch_put_price_parser.add_argument("--port", type=int, default=50061, help="Server port")
+    batch_put_price_parser.add_argument("entries", help="Comma-separated SYMBOL:PRICE pairs, e.g. \"AAPL:150.0,NVDA:800.0\"")
+
     # get-price command
     get_price_parser = subparsers.add_parser("get-price", help="Get a stock price")
     get_price_parser.add_argument("--host", default="localhost", help="Server hostname")
@@ -302,6 +369,8 @@ def main():
         return asyncio.run(cmd_cluster_info(args))
     elif args.command == "put-price":
         return asyncio.run(cmd_put_price(args))
+    elif args.command == "batch-put-price":
+        return asyncio.run(cmd_batch_put_price(args))
     elif args.command == "get-price":
         return asyncio.run(cmd_get_price(args))
     elif args.command == "dump-state":

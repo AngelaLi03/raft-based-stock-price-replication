@@ -110,24 +110,23 @@ class ClientService(client_pb2_grpc.ClientServiceServicer):
     async def BatchPutPrice(self, request, context):
         """Handle BatchPutPrice RPC."""
         logger.debug(f"Received BatchPutPrice with {len(request.ticker_prices)} prices")
-        
+
         try:
-            # For Week 1, just return NOT_LEADER
-            if self.raft_node.state.value != "leader":
-                return client_pb2.BatchPutPriceResponse(
-                    ok=False,
-                    leader_hint="",
-                    error_message="Not leader"
-                )
-            
-            # TODO: In Week 2, implement batch processing
+            from kv.state_machine import TickerPrice
+            ticker_prices = [
+                TickerPrice(symbol=tp.symbol, price=tp.price, timestamp=tp.timestamp)
+                for tp in request.ticker_prices
+            ]
+
+            result = await self.raft_node.batch_put_price(ticker_prices)
+
             response = client_pb2.BatchPutPriceResponse(
-                ok=True,
-                leader_hint=self.raft_node.node_id,
-                error_message=""
+                ok=result["ok"],
+                leader_hint=result["leader_hint"] or "",
+                error_message=result["error_message"] or ""
             )
             return response
-            
+
         except Exception as e:
             logger.error(f"Error handling BatchPutPrice: {e}")
             context.set_code(grpc.StatusCode.INTERNAL)

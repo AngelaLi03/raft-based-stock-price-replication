@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from raft.types import PeerInfo, RaftState, LogEntry
 from raft.node import RaftNode
-from kv.state_machine import serialize_put_command
+from kv.state_machine import serialize_put_command, TickerPrice
 
 
 @pytest.fixture
@@ -282,12 +282,77 @@ async def test_put_price_not_leader(raft_node):
     """Test PutPrice when not leader."""
     # Make node follower
     raft_node.state = RaftState.FOLLOWER
-    
+
     # Test PutPrice
     result = await raft_node.put_price("AAPL", 150.0, 1234567890)
-    
+
     assert result["ok"] is False
     assert result["error_message"] == "Not leader"
+
+
+@pytest.mark.asyncio
+async def test_batch_put_price_replication(raft_node):
+    """Test BatchPutPrice replicates the whole batch as one log entry."""
+    raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 1
+    raft_node.batch_size = 1
+
+    for peer in raft_node.peers:
+        raft_node.next_index[peer.node_id] = 1
+        raft_node.match_index[peer.node_id] = 0
+
+    raft_node._replicate_to_peers = AsyncMock(return_value=True)
+    raft_node._update_commit_index = AsyncMock()
+    raft_node.storage.get_last_log_index = MagicMock(return_value=0)
+    raft_node.storage.append_entries = MagicMock()
+
+    ticker_prices = [
+        TickerPrice(symbol="AAPL", price=150.0, timestamp=1234567890),
+        TickerPrice(symbol="NVDA", price=800.0, timestamp=1234567890),
+    ]
+    result = await raft_node.batch_put_price(ticker_prices)
+
+    assert result["ok"] is True
+    assert result["leader_hint"] == "node1"
+    assert result["error_message"] is None
+
+    # One log entry for the whole batch, not one per price
+    raft_node.storage.append_entries.assert_called_once()
+    appended = raft_node.storage.append_entries.call_args[0][0]
+    assert len(appended) == 1
+    raft_node._replicate_to_peers.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_batch_put_price_not_leader(raft_node):
+    """Test BatchPutPrice when not leader."""
+    raft_node.state = RaftState.FOLLOWER
+
+    ticker_prices = [TickerPrice(symbol="AAPL", price=150.0, timestamp=1234567890)]
+    result = await raft_node.batch_put_price(ticker_prices)
+
+    assert result["ok"] is False
+    assert result["error_message"] == "Not leader"
+
+
+@pytest.mark.asyncio
+async def test_batch_put_price_applies_all_entries(raft_node):
+    """Test that a committed BatchPutPrice entry applies every symbol."""
+    from kv.state_machine import serialize_batch_put_command
+
+    ticker_prices = [
+        TickerPrice(symbol="AAPL", price=150.0, timestamp=1234567890),
+        TickerPrice(symbol="NVDA", price=800.0, timestamp=1234567890),
+    ]
+    entry = LogEntry(index=1, term=1, command_bytes=serialize_batch_put_command(ticker_prices))
+    raft_node.storage.append_entries([entry])
+    raft_node.commit_index = 1
+    raft_node.last_applied = 0
+
+    await raft_node._apply_committed_entries()
+
+    assert raft_node.kv_state_machine.get("AAPL").price == 150.0
+    assert raft_node.kv_state_machine.get("NVDA").price == 800.0
 
 
 @pytest.mark.asyncio
