@@ -640,11 +640,10 @@ class RaftNode:
         try:
             # Get previous log entry info
             prev_log_index = self.next_index[peer.node_id] - 1
-            prev_log_term = 0
-            if prev_log_index > 0:
-                prev_entry = self.storage.get_log_entry(prev_log_index)
-                if prev_entry:
-                    prev_log_term = prev_entry.term
+            # get_term_at_index (not get_log_entry) - prev_log_index can
+            # legitimately land exactly on the snapshot boundary, which
+            # get_log_entry can't see (see RaftStorage.get_term_at_index).
+            prev_log_term = self.storage.get_term_at_index(prev_log_index)
             
             # Send AppendEntries RPC
             response = await self._append_entries_to_peer(
@@ -662,8 +661,21 @@ class RaftNode:
                 pass
             
             if response and response.success:
-                # Update next_index and match_index
-                self.next_index[peer.node_id] = len(entries) + self.next_index[peer.node_id]
+                # Update next_index/match_index using an absolute value
+                # derived from *this RPC's own* prev_log_index, and only
+                # ever move it forward (max, never regress). Concurrent
+                # flushes can both be in flight for the same peer at once
+                # (batch_lock only protects the pending_entries snapshot,
+                # not the network round trip - see _flush_pending_entries),
+                # so a second, already-superseded success response landing
+                # after a newer one must not blindly add its own len(entries)
+                # on top of whatever next_index currently holds - that
+                # double-counts and overshoots past what the follower
+                # actually has, which then makes every subsequent RPC fail
+                # log matching. Found live: leader sending prev_log_index=15
+                # while every follower only had 10 entries.
+                confirmed_next_index = prev_log_index + len(entries) + 1
+                self.next_index[peer.node_id] = max(self.next_index[peer.node_id], confirmed_next_index)
                 self.match_index[peer.node_id] = self.next_index[peer.node_id] - 1
                 return {"success": True, "match_index": response.match_index}
             else:
@@ -689,10 +701,14 @@ class RaftNode:
         match_indices.sort(reverse=True)
         majority_index = match_indices[(len(self.peers) + 1) // 2]
         
-        # Only commit entries from current term
+        # Only commit entries from current term. get_term_at_index (not
+        # get_log_entry) - majority_index can legitimately land exactly on
+        # the snapshot boundary, since a peer caught up via InstallSnapshot
+        # has its match_index set to exactly that boundary (see
+        # _send_install_snapshot_to_peer), and get_log_entry can't see it.
         if majority_index > self.commit_index:
-            entry = self.storage.get_log_entry(majority_index)
-            if entry and entry.term == self.election_manager.current_term:
+            majority_term = self.storage.get_term_at_index(majority_index)
+            if majority_term == self.election_manager.current_term:
                 old_commit_index = self.commit_index
                 self.commit_index = majority_index
                 self.storage.set_commit_index(self.commit_index)
@@ -767,6 +783,13 @@ class RaftNode:
         
         # Check log matching property
         if not self._check_log_matching(request.prev_log_index, request.prev_log_term):
+            logger.warning(
+                f"Log matching failed from {request.leader_id}: "
+                f"prev_log_index={request.prev_log_index}, prev_log_term={request.prev_log_term}, "
+                f"my last_log_index={self.storage.get_last_log_index()}, "
+                f"my term_at(prev_log_index)={self.storage.get_term_at_index(request.prev_log_index)}, "
+                f"my last_included_index={self.storage.last_included_index}"
+            )
             response = raft_pb2.AppendEntriesResponse(
                 term=self.election_manager.current_term,
                 success=False,
@@ -878,10 +901,21 @@ class RaftNode:
         """
         if prev_log_index == 0:
             return True
-        
+
         if prev_log_index > self.storage.get_last_log_index():
             return False
-        
+
+        # The snapshot boundary itself is a valid match point - it's exactly
+        # what a follower just installed via InstallSnapshot - but it isn't
+        # addressable via get_log_entry (only entries after it remain in the
+        # log), so it needs its own check here. Without this, the leader's
+        # very first AppendEntries after a successful snapshot install
+        # always fails log matching (prev_log_index lands exactly on the
+        # boundary), next_index gets decremented back onto the boundary, and
+        # the leader re-sends InstallSnapshot again next heartbeat - forever.
+        if prev_log_index == self.storage.last_included_index:
+            return prev_log_term == self.storage.last_included_term
+
         entry = self.storage.get_log_entry(prev_log_index)
         if not entry:
             return False
@@ -938,11 +972,10 @@ class RaftNode:
 
             # Get previous log entry info
             prev_log_index = self.next_index[peer.node_id] - 1
-            prev_log_term = 0
-            if prev_log_index > 0:
-                prev_entry = self.storage.get_log_entry(prev_log_index)
-                if prev_entry:
-                    prev_log_term = prev_entry.term
+            # get_term_at_index (not get_log_entry) - prev_log_index can
+            # legitimately land exactly on the snapshot boundary, which
+            # get_log_entry can't see (see RaftStorage.get_term_at_index).
+            prev_log_term = self.storage.get_term_at_index(prev_log_index)
             
             # Get entries to send (for catch-up)
             entries_to_send = []
@@ -964,9 +997,14 @@ class RaftNode:
             )
             
             if response and response.success:
-                # Update next_index and match_index
+                # Update next_index/match_index using an absolute value
+                # derived from *this RPC's own* prev_log_index, and only
+                # ever move it forward - see the matching comment in
+                # _send_append_entries_to_peer for why (this path races
+                # against that one for the very same peer).
                 if entries_to_send:
-                    self.next_index[peer.node_id] = len(entries_to_send) + self.next_index[peer.node_id]
+                    confirmed_next_index = prev_log_index + len(entries_to_send) + 1
+                    self.next_index[peer.node_id] = max(self.next_index[peer.node_id], confirmed_next_index)
                     self.match_index[peer.node_id] = self.next_index[peer.node_id] - 1
                     logger.info(f"Sent {len(entries_to_send)} entries to {peer.node_id} for catch-up")
                     # A follower catching up here (rather than via the
@@ -980,7 +1018,9 @@ class RaftNode:
                     # found via live 15-node failover testing.
                     await self._update_commit_index()
                 else:
-                    self.match_index[peer.node_id] = prev_log_index
+                    # Same reasoning as above: only move match_index forward,
+                    # never regress it based on a possibly-stale prev_log_index.
+                    self.match_index[peer.node_id] = max(self.match_index[peer.node_id], prev_log_index)
                     logger.debug(f"Sent heartbeat to {peer.node_id}")
             else:
                 # Decrement next_index for retry

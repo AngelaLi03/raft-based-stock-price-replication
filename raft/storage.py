@@ -197,6 +197,25 @@ class RaftStorage:
             return self.log[-1].term
         return self.last_included_term
 
+    def get_term_at_index(self, index: int) -> int:
+        """
+        Get the term of the entry at the given absolute index, correctly
+        handling the snapshot boundary. The boundary index itself
+        (last_included_index) is authoritative - it's what the snapshot
+        covers - but it isn't addressable via get_log_entry (only entries
+        *after* it remain in self.log), so callers computing prev_log_term
+        for AppendEntries/log-matching must go through this rather than
+        get_log_entry directly, or they'll incorrectly treat the boundary
+        as "no such entry" and fail a comparison that should have matched.
+        Returns 0 for index 0 (nothing exists yet).
+        """
+        if index == 0:
+            return 0
+        if index == self.last_included_index:
+            return self.last_included_term
+        entry = self.get_log_entry(index)
+        return entry.term if entry else 0
+
     def append_entries(self, entries: List[LogEntry]) -> None:
         """Append new entries to the log."""
         self.log.extend(entries)

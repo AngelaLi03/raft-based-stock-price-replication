@@ -248,3 +248,78 @@ class TestInstallSnapshotRPC:
 
         assert response.term == 5
         assert node.storage.last_included_index == 0  # untouched
+
+
+class TestSnapshotBoundaryLogMatching:
+    """
+    Regression coverage for a real bug found via live testing: the entry at
+    exactly the snapshot boundary (last_included_index) isn't reachable via
+    get_log_entry (only entries *after* it remain in the log), so both the
+    log-matching check and the prev_log_term a leader sends need their own
+    handling of that boundary index specifically - otherwise a follower's
+    very first AppendEntries after receiving a snapshot always fails log
+    matching, next_index gets decremented back onto the boundary, and the
+    leader re-sends InstallSnapshot again next heartbeat. Forever. Live
+    symptom: leader logs showed "Installed snapshot on nodeX" repeating in
+    a tight loop for every peer, and every write failed with "Replication
+    failed" because no follower could ever actually accept a real entry
+    again once it had received one snapshot.
+    """
+
+    def test_check_log_matching_succeeds_exactly_at_snapshot_boundary(self, mock_peers, temp_data_dir):
+        node = RaftNode(node_id="node2", peers=mock_peers, data_dir=temp_data_dir)
+        # Simulate a follower that just received a snapshot covering up to
+        # index 10 (term 3) and therefore has an empty log - exactly the
+        # state right after handle_install_snapshot.
+        node.storage.last_included_index = 10
+        node.storage.last_included_term = 3
+
+        # The leader's very next AppendEntries after installing that
+        # snapshot uses prev_log_index=10, prev_log_term=3 (the boundary
+        # itself) - this must match.
+        assert node._check_log_matching(10, 3) is True
+        # A mismatched term at the boundary must still correctly fail.
+        assert node._check_log_matching(10, 99) is False
+
+    def test_get_term_at_index_returns_snapshot_term_at_boundary(self, temp_data_dir):
+        from raft.storage import RaftStorage
+        storage = RaftStorage(temp_data_dir, "node1")
+        storage.append_entries([
+            LogEntry(index=1, term=1, command_bytes=b"a"),
+            LogEntry(index=2, term=1, command_bytes=b"b"),
+        ])
+        storage.save_snapshot(2, last_included_term=7, kv_state={})
+
+        # Index 2 is now the snapshot boundary - not in self.log anymore,
+        # but get_term_at_index must still resolve its real term (7), not 0.
+        assert storage.get_term_at_index(2) == 7
+        assert storage.get_term_at_index(0) == 0
+
+    @pytest.mark.asyncio
+    async def test_leader_sends_correct_prev_log_term_at_snapshot_boundary(self, mock_peers, temp_data_dir):
+        node = RaftNode(node_id="node1", peers=mock_peers, data_dir=temp_data_dir)
+        node.state = RaftState.LEADER
+        node.election_manager.current_term = 5
+        node.storage.last_included_index = 10
+        node.storage.last_included_term = 3
+        # This peer just got caught up via InstallSnapshot to exactly the
+        # boundary - next_index is one past it, so prev_log_index will be
+        # the boundary itself.
+        node.next_index["node2"] = 11
+        node.match_index["node2"] = 10
+
+        captured = {}
+
+        async def fake_append_entries_to_peer(peer_id, peer, term, prev_log_index, prev_log_term, entries, leader_commit):
+            captured["prev_log_index"] = prev_log_index
+            captured["prev_log_term"] = prev_log_term
+            return MagicMock(success=True, match_index=10)
+
+        node._append_entries_to_peer = fake_append_entries_to_peer
+
+        await node._send_heartbeat_to_peer(mock_peers[0])
+
+        assert captured["prev_log_index"] == 10
+        # Before the fix this was always 0 (get_log_entry(10) returns None
+        # at the boundary), which would make the follower reject the RPC.
+        assert captured["prev_log_term"] == 3

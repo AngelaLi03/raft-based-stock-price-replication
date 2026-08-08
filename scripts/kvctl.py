@@ -31,7 +31,14 @@ class RaftClient:
         self.host = host
         self.port = port
         self.address = f"{host}:{port}"
-    
+
+    async def close(self) -> None:
+        """No-op: each call above opens its own short-lived channel rather
+        than holding a persistent one, so there's nothing to close. Exists
+        so callers that manage a pool of clients (benchmark.py, chaos_test.py)
+        can uniformly close() every client without special-casing this one."""
+        pass
+
     async def get_cluster_info(self) -> Optional[dict]:
         """Get cluster information."""
         try:

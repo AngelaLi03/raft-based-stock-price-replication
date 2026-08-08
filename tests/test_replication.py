@@ -70,6 +70,65 @@ async def test_log_replication_leader(raft_node):
 
 
 @pytest.mark.asyncio
+async def test_next_index_does_not_overshoot_on_concurrent_stale_success(raft_node):
+    """
+    Regression test for a real bug found via live testing under concurrent
+    write load: batch_lock only protects the pending_entries snapshot in
+    _flush_pending_entries, not the actual network round trip - so two
+    flushes for the same peer can genuinely be in flight at once. The old
+    code did `next_index[peer] = len(entries) + next_index[peer]`, reading
+    whatever next_index currently held at *response* time. If a second,
+    already-superseded call's success response landed after a newer one had
+    already advanced next_index, it added its own len(entries) on top -
+    double-counting and overshooting past what the follower actually had.
+    Symptom: leader sent prev_log_index=15 while every follower only had 10
+    entries, and every subsequent AppendEntries failed log matching forever.
+    """
+    raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 1
+    raft_node.next_index["node2"] = 6
+    raft_node.match_index["node2"] = 5
+    peer = next(p for p in raft_node.peers if p.node_id == "node2")
+
+    # Both batches are 5 entries; both calls will read the SAME starting
+    # next_index=6 (prev_log_index=5) if they're genuinely concurrent - a
+    # real network round trip (here, an awaited asyncio.sleep) is what
+    # forces the interleaving: _send_append_entries_to_peer reads
+    # next_index synchronously *before* this await, so asyncio.gather-ing
+    # two calls reproduces exactly the race that caused the live bug,
+    # where sequential awaiting would not (the second call would simply
+    # see the first's already-updated value).
+    entries_a = [LogEntry(index=i, term=1, command_bytes=b"a") for i in range(6, 11)]
+    entries_b = [LogEntry(index=i, term=1, command_bytes=b"b") for i in range(6, 11)]
+
+    observed_prev_log_indices = []
+
+    async def fake_append_entries_to_peer(peer_id, peer_obj, term, prev_log_index, prev_log_term, entries, leader_commit):
+        observed_prev_log_indices.append(prev_log_index)
+        await asyncio.sleep(0.01)  # real round trip - forces both to start before either finishes
+        return MagicMock(success=True, match_index=prev_log_index + len(entries))
+
+    raft_node._append_entries_to_peer = fake_append_entries_to_peer
+
+    results = await asyncio.gather(
+        raft_node._send_append_entries_to_peer(peer, entries_a),
+        raft_node._send_append_entries_to_peer(peer, entries_b),
+    )
+
+    assert all(r["success"] for r in results)
+    # Confirms the race actually happened: both read the same stale value.
+    assert observed_prev_log_indices == [5, 5]
+
+    # Before the fix, whichever response was processed second would do
+    # next_index = len(entries) + next_index (already-advanced-by-the-first)
+    # = 5 + 11 = 16 - overshooting past the 10 entries the follower actually
+    # has. The fix caps it at max(current, this_call's own prev_log_index +
+    # len(entries) + 1) = max(_, 5+5+1=11), which both calls agree on.
+    assert raft_node.next_index["node2"] == 11
+    assert raft_node.match_index["node2"] == 10
+
+
+@pytest.mark.asyncio
 async def test_commit_index_update(raft_node):
     """Test commit index update based on majority replication."""
     # Make node leader
