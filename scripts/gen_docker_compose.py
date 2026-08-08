@@ -84,6 +84,7 @@ def render(num_nodes: int) -> str:
     lines.append("networks:")
     lines.append("  raft-network:")
     lines.append("    driver: bridge")
+    lines.append("    name: raft-network")
 
     return "\n".join(lines) + "\n"
 

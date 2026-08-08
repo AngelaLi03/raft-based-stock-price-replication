@@ -367,3 +367,4 @@ volumes:
 networks:
   raft-network:
     driver: bridge
+    name: raft-network
