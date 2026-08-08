@@ -7,7 +7,7 @@ crash recovery from a snapshot, and the InstallSnapshot RPC (both sides).
 import pytest
 import tempfile
 import time
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock
 
 from raft.storage import RaftStorage
 from raft.node import RaftNode
@@ -232,7 +232,6 @@ class TestInstallSnapshotRPC:
 
     @pytest.mark.asyncio
     async def test_install_snapshot_rejects_stale_term(self, mock_peers, temp_data_dir):
-        from raft.proto import raft_pb2
 
         node = RaftNode(node_id="node2", peers=mock_peers, data_dir=temp_data_dir)
         node.election_manager.current_term = 5

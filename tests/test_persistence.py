@@ -7,7 +7,6 @@ import asyncio
 import tempfile
 import os
 import json
-import time
 from unittest.mock import patch
 
 from raft.storage import RaftStorage

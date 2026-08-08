@@ -3,7 +3,6 @@ Tests for crash recovery and persistence functionality.
 """
 
 import pytest
-import asyncio
 import tempfile
 import os
 import json
@@ -287,7 +286,6 @@ async def test_follower_catch_up_scenario(raft_node):
     raft_node.storage.append_entries([entry1])
     
     # Simulate AppendEntries from leader with new entries
-    from raft.proto import raft_pb2
     
     mock_request = MagicMock()
     mock_request.term = 1
@@ -297,9 +295,6 @@ async def test_follower_catch_up_scenario(raft_node):
     mock_request.leader_commit = 3
     
     # Create new entries
-    entry2 = LogEntry(index=2, term=1, command_bytes=serialize_put_command("NVDA", 800.0, 1234567891))
-    entry3 = LogEntry(index=3, term=1, command_bytes=serialize_put_command("MSFT", 300.0, 1234567892))
-    
     mock_entry2 = MagicMock()
     mock_entry2.index = 2
     mock_entry2.term = 1
@@ -352,7 +347,6 @@ async def test_log_truncation_during_catch_up(raft_node):
     raft_node.storage.append_entries([entry1, entry2])
     
     # Simulate AppendEntries that requires truncation
-    from raft.proto import raft_pb2
     
     mock_request = MagicMock()
     mock_request.term = 1
@@ -362,8 +356,6 @@ async def test_log_truncation_during_catch_up(raft_node):
     mock_request.leader_commit = 2
     
     # New entry to replace conflicting one
-    entry2_new = LogEntry(index=2, term=1, command_bytes=serialize_put_command("NVDA", 800.0, 1234567891))
-    
     mock_entry2 = MagicMock()
     mock_entry2.index = 2
     mock_entry2.term = 1

@@ -5,10 +5,7 @@ Production implementation with atomic writes, fsync, and crash recovery.
 
 import json
 import os
-import tempfile
-import asyncio
 from typing import List, Optional
-from dataclasses import asdict
 import logging
 import time
 

@@ -3,9 +3,7 @@ Tests for idempotent command application.
 """
 
 import pytest
-import asyncio
 import tempfile
-from unittest.mock import MagicMock
 
 from kv.state_machine import KVStateMachine, serialize_put_command, serialize_batch_put_command
 from raft.types import LogEntry
