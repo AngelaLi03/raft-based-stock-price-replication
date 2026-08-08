@@ -238,6 +238,22 @@ async def test_metrics_tick_task_starts_on_start_and_cancels_on_stop(raft_node):
     assert raft_node.metrics_tick_task is not None
     assert not raft_node.metrics_tick_task.done()
 
+    # Yield to the event loop so the tick task actually begins running and
+    # reaches its `await asyncio.sleep(2.0)` before we cancel it - otherwise
+    # the CancelledError fires before the coroutine ever starts, and it never
+    # reaches the loop body's own `except asyncio.CancelledError: break`,
+    # making the assertions below pass coincidentally regardless of whether
+    # that handling is correct.
+    await asyncio.sleep(0)
+
     await raft_node.stop()
 
-    assert raft_node.metrics_tick_task.cancelled()
+    # Once cancelled while suspended inside the loop's own `await
+    # asyncio.sleep(2.0)`, a correctly-written loop catches CancelledError
+    # and breaks, so the coroutine returns normally: done() is True but
+    # cancelled() is False. A loop that failed to catch/break on
+    # cancellation would instead leave the task in the cancelled state
+    # (done() True AND cancelled() True) - asserting both is what actually
+    # distinguishes correct cancellation handling from broken.
+    assert raft_node.metrics_tick_task.done()
+    assert not raft_node.metrics_tick_task.cancelled()
