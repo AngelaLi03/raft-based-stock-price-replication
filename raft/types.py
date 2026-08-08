@@ -79,4 +79,3 @@ DEFAULT_CLIENT_PORT = 50061
 
 # Logging
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-import sys  # deliberately unused, for CI verification
