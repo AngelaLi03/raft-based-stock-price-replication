@@ -208,7 +208,7 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 
 ## Monitoring & Alerting
 
-Prometheus + Grafana run as a separate compose stack (`ops/docker-compose.monitoring.yml`) on top of the cluster's existing per-node metrics, joining the cluster's `raft-network` so Prometheus can scrape all 15 nodes by service name. Everything - datasource, dashboard, alert rules - is provisioned as code under `ops/monitoring/`, not clicked together manually.
+Prometheus + Grafana run as a separate compose stack (`ops/docker-compose.monitoring.yml`) on top of the cluster's existing per-node metrics, joining the cluster's `raft-network` so Prometheus can scrape all 15 nodes by service name. Everything — datasource, dashboard, alert rules — is provisioned as code under `ops/monitoring/`, not clicked together manually.
 
 ```bash
 # Bring up the cluster first (see "Running the Cluster" above), then:
@@ -223,7 +223,7 @@ cd ..
 
 The dashboard's 5s refresh is fast enough to watch a live failover: kill the current leader's container and watch the role panel flip, the term increment, and the leader-changes panel spike within a couple of refresh cycles.
 
-Tear down with `docker compose -f docker-compose.monitoring.yml down -v` (before or after the main cluster's own teardown).
+Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -v` (before or after the main cluster's own teardown).
 
 ## API Reference
 

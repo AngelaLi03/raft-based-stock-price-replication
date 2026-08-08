@@ -72,12 +72,13 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "max(raft_commit_index) - raft_commit_index", "legendFormat": "{{node_id}}", "refId": "A" }
+        { "expr": "scalar(max(raft_commit_index)) - raft_commit_index", "legendFormat": "{{node_id}}", "refId": "A" }
       ]
     },
     {
       "id": 6,
       "title": "Quorum Health (reachable nodes, need 8/15)",
+      "description": "The '8/15' in the title and the threshold value below are hardcoded for a 15-node cluster. If the cluster is ever regenerated at a different --nodes count via scripts/gen_docker_compose.py, update both by hand.",
       "type": "stat",
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },

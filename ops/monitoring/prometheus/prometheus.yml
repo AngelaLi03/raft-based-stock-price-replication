@@ -5,6 +5,10 @@ global:
 scrape_configs:
   - job_name: raft-nodes
     static_configs:
+      # These 15 targets are hardcoded to match the cluster's current
+      # --nodes count (see scripts/gen_docker_compose.py). If the cluster
+      # is ever regenerated at a different node count, update this list by
+      # hand - it isn't derived from gen_docker_compose.py automatically.
       - targets:
           - node1:8001
           - node2:8002

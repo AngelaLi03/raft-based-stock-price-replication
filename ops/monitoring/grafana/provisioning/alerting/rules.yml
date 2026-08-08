@@ -10,6 +10,7 @@ groups:
         title: No leader elected
         condition: C
         for: 10s
+        noDataState: Alerting
         labels:
           severity: critical
         annotations:
@@ -21,6 +22,11 @@ groups:
               from: 60
               to: 0
             model:
+              # `== bool 2` (not `count(raft_node_role == 2)`) is deliberate:
+              # sum() over an all-false comparison still yields a 0-valued
+              # series, whereas count() over zero matches returns no data at
+              # all - which would silently turn "definitely no leader" into
+              # a NoData state instead of firing this alert.
               expr: sum(raft_node_role == bool 2)
               instant: true
               refId: A
@@ -51,6 +57,7 @@ groups:
         title: Leader changing too frequently
         condition: C
         for: 0s
+        noDataState: OK
         labels:
           severity: warning
         annotations:
