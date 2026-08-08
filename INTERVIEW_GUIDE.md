@@ -436,6 +436,8 @@ If log doesn't match:
 
 **Key Metrics**:
 - `raft_elections_total`: Number of leader elections
+- `raft_election_duration_ms`: Histogram of election duration (start-to-resolution, win or lose)
+- `raft_node_role`: Gauge, 0=follower/1=candidate/2=leader — the metric the dashboard's role panel and both alert rules key off of
 - `raft_commits_total`: Number of committed entries
 - `raft_replication_latency_ms`: Time to replicate entries
 - `raft_crash_recoveries_total`: Recovery operations
@@ -446,6 +448,20 @@ If log doesn't match:
 - **Debugging**: Identify performance bottlenecks
 - **Alerting**: Detect leader churn, high latency
 - **Capacity Planning**: Understand throughput patterns
+
+### Grafana Dashboards & Alerting
+
+Metrics existing and being *queryable* isn't the same as anyone noticing when something's wrong — this layer turns them into a live dashboard and real alerts, provisioned entirely as code (no manual UI setup), running as a separate `docker-compose.monitoring.yml` stack on top of the cluster.
+
+**"Cluster Health" dashboard** (6 panels, all live-verified against the running cluster): current role per node, current term per node, leader changes over time, election duration, per-follower commit lag, quorum health. 5s refresh — fast enough to watch a live failover unfold panel by panel.
+
+**Two alert rules**, visual-only in v1 (Grafana's Alerting UI, no external Slack/email/webhook delivery):
+- **No leader for >10s** — `sum(raft_node_role == bool 2) < 1`, sustained. The `== bool` modifier matters: a plain `count(raft_node_role == 2)` returns *no data* (not `0`) when nothing matches, and Grafana treats "no data" as a distinct, separately-configured state — the naive query would silently fail to detect the exact case it exists for.
+- **Leader flapping** — more than 2 leader changes in a 60s window (`increase(raft_leader_changes_total[60s]) > 2`).
+
+**A good "tell me about a bug you found" story from this layer**: the first version of the per-follower commit-lag panel used `max(raft_commit_index) - raft_commit_index` and silently showed nothing — `max()` without a `by(...)` clause drops every label, so the label-less left side can never vector-match the labeled right side in Prometheus's binary-operator matching. Fixed with `scalar(max(...))` instead, which explicitly converts to a plain number that subtracts against every series without needing a label match. A second, similar-shaped bug: the election-duration panel queried a real, correctly-defined Histogram metric that nothing in the codebase ever actually recorded to — the metric existed, the panel existed, but nobody had wired the call site that would feed it (fixed by timing the election in `ElectionManager._start_election`). Both are "the query parses and returns cleanly, and is still wrong" bugs — the kind unit tests structurally can't catch, only live verification against real data can.
+
+**And a bug in the demo/verification tooling itself, not the monitoring stack**: an early version of the "trigger the no-leader alert" test scenario stopped a fixed set of node IDs regardless of who was currently leader. When the actual leader happened to survive, the alert correctly never fired — because Raft has no lease/step-down-on-isolation mechanism; a leader cut off from the majority keeps believing and reporting itself as leader indefinitely, it just can't commit anything. That's not a monitoring bug, it's a real, documented characteristic of the underlying algorithm (see "Known Issues" in the README) that the test needed to account for by always including the actual leader in the set of nodes it stops.
 
 ### Structured Logging
 
@@ -632,6 +648,13 @@ Together, these guarantee linearizability - operations appear to execute atomica
 
 These metrics help identify bottlenecks, detect leader churn, and understand system performance under load."
 
+### "How do you monitor this in production?"
+
+**Answer**:
+"Beyond just exposing metrics, I built a Grafana + Prometheus stack — a separate `docker-compose.monitoring.yml` that scrapes all nodes and provisions everything as code: datasource, dashboard, and alert rules, no manual clicking. The dashboard has 6 panels — role/term per node, leader changes over time, election duration, per-follower commit lag, and quorum health — and two alert rules, no-leader-for-10s and leader-flapping.
+
+The interesting part is a bug I found live-testing the alerting itself, not the Raft code: my first version of the 'no leader' PromQL condition used `count(raft_node_role == 2)`, which returns *no data* — not zero — when nothing matches. Grafana treats 'no data' as a separate state from 'the condition is false,' so that query would silently fail to fire on exactly the case it's meant to catch. I fixed it with `sum(raft_node_role == bool 2)`, which keeps every series present with a 0-or-1 value instead of filtering series out, so the sum is always a real number. It's a good example of why I don't trust a dashboard or an alert just because it's provisioned without an error — I stop live nodes and actually watch the alert transition firing-to-resolved before I trust it, the same discipline I use for testing the consensus algorithm itself."
+
 ### "How does batching work?"
 
 **Answer**:
@@ -659,6 +682,7 @@ This reduces the number of RPCs from N (one per write) to N/batch_size, signific
 - **Throughput**: 1000+ ops/second
 - **Failover Time**: 1-2 seconds
 - **Recovery Time**: < 5 seconds
+- **Monitoring**: Prometheus (`:9090`) + Grafana (`:3000`), 6-panel dashboard, 2 alert rules (no-leader >10s, flapping >2/60s), 5s dashboard refresh
 
 ---
 
