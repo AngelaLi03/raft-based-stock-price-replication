@@ -13,7 +13,7 @@ Raft is the algorithm behind the consistency guarantees of systems like etcd (Ku
 - **Protocol Buffers** for wire format / service definitions (`proto/raft.proto`, `proto/client.proto`)
 - **Docker Compose** for local cluster orchestration (15-node by default, generated — see `scripts/gen_docker_compose.py`)
 - **Prometheus client** for metrics export (added in the in-progress Week 4 work)
-- **pytest** + `pytest-asyncio` for the test suite (157 tests, ~4,100 lines across 15 files)
+- **pytest** + `pytest-asyncio` for the test suite (161 tests, ~4,100 lines across 15 files)
 
 ## Concurrency Model
 
@@ -72,7 +72,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 - KV state machine (`kv/state_machine.py`) — in-memory store with periodic snapshotting, idempotent command application
 - `PutPrice` / `BatchPutPrice` / `GetPrice` / `GetClusterInfo` — implemented and replicated correctly
 - 15-node cluster (`scripts/gen_docker_compose.py --nodes N`), verified live via `docker compose up` — see "15-Node Verification" below
-- **Full test suite passes**: 157 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice + 5 for the gRPC/metrics-server layer + 5 for benchmark.py/chaos_test.py importability + 4 for the InstallSnapshot boundary and next_index overshoot bugs), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility
+- **Full test suite passes**: 161 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice + 5 for the gRPC/metrics-server layer + 5 for benchmark.py/chaos_test.py importability + 4 for the InstallSnapshot boundary and next_index overshoot bugs + 1 for the node-role metric + 3 for role/state metrics on followers), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility
 
 ### Fixed this session
 1. **Leader-election safety gap** (was the single highest-priority correctness bug): vote granting now checks that the candidate's log is at least as up-to-date as the voter's before granting (`raft/election.py:_is_log_up_to_date`, implementing Raft §5.4.1), and candidates advertise their real `last_log_index`/`last_log_term` (from `RaftNode._get_last_log_info`, backed by storage) instead of hardcoded zeros.
@@ -139,7 +139,7 @@ bash scripts/gen_protos.sh
 PYTHONPATH=. pytest tests/ -v
 ```
 
-157 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+161 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
 
 ## Running the Cluster
 
@@ -206,6 +206,25 @@ PYTHONPATH=. python3 scripts/kvctl.py dump-state --host localhost --port <new_le
 PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 51065
 ```
 
+## Monitoring & Alerting
+
+Prometheus + Grafana run as a separate compose stack (`ops/docker-compose.monitoring.yml`) on top of the cluster's existing per-node metrics, joining the cluster's `raft-network` so Prometheus can scrape all 15 nodes by service name. Everything - datasource, dashboard, alert rules - is provisioned as code under `ops/monitoring/`, not clicked together manually.
+
+```bash
+# Bring up the cluster first (see "Running the Cluster" above), then:
+cd ops
+docker compose -f docker-compose.monitoring.yml up --detach
+cd ..
+```
+
+- **Prometheus**: `http://localhost:9090` — scrapes all 15 nodes' `/metrics` under job `raft-nodes`.
+- **Grafana**: `http://localhost:3000` (`admin`/`admin`) — "Cluster Health" dashboard auto-loads with 6 panels: current role per node, current term per node, leader changes over time, election duration, per-follower commit lag, and quorum health.
+- **Alerts** (visual-only in Grafana's Alerting UI, no external delivery in v1): no leader for >10s, and leader changing more than twice in 60s (flapping).
+
+The dashboard's 5s refresh is fast enough to watch a live failover: kill the current leader's container and watch the role panel flip, the term increment, and the leader-changes panel spike within a couple of refresh cycles.
+
+Tear down with `docker compose -f docker-compose.monitoring.yml down -v` (before or after the main cluster's own teardown).
+
 ## API Reference
 
 ### Client Service (external, `proto/client.proto`)
@@ -247,8 +266,10 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 │   ├── gen_docker_compose.py   # Generates ops/docker-compose.yml for N nodes
 │   ├── benchmark.py            # Load benchmark (import + mixed-workload race fixed, live verification partial)
 │   └── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
-├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
+├── tests/                      # 15 files, ~4,100 lines, 161 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
+│   ├── docker-compose.monitoring.yml  # Prometheus + Grafana, joins raft-network
+│   └── monitoring/             # Prometheus scrape config, Grafana datasource/dashboard/alert provisioning
 └── README.md
 ```
 
@@ -283,7 +304,7 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 ## Future Roadmap (not started)
 
 - **Live Data Integration**: real-time price ingestion (`ingestor/feeder.py`), external API integration (Yahoo Finance / Alpha Vantage), automatic leader discovery/redirect, batch ingestion
-- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, Grafana integration for metrics, CI/CD
+- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, CI/CD
 
 ## Additional Resources
 
