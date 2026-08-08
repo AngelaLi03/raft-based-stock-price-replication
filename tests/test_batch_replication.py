@@ -5,8 +5,7 @@ Tests for batch replication functionality.
 import pytest
 import asyncio
 import time
-from unittest.mock import Mock, AsyncMock, patch
-from typing import List
+from unittest.mock import Mock, AsyncMock
 
 from raft.node import RaftNode
 from raft.types import PeerInfo, LogEntry, RaftState

@@ -6,7 +6,6 @@ import pytest
 import asyncio
 import time
 from unittest.mock import Mock, AsyncMock, patch
-from typing import List
 
 from raft.node import RaftNode
 from raft.types import PeerInfo, LogEntry, RaftState
@@ -94,7 +93,6 @@ class TestChaosRecovery:
         raft_node.kv_state_machine.dump_state = Mock(return_value={"entries": {}})
         
         # Simulate receiving AppendEntries with new entries
-        from raft.proto import raft_pb2
         
         # Create mock AppendEntries request
         request = Mock()
@@ -252,7 +250,6 @@ class TestChaosRecovery:
         raft_node.kv_state_machine.apply_command = AsyncMock()
         
         # Create mock AppendEntries request that will cause truncation
-        from raft.proto import raft_pb2
         
         request = Mock()
         request.term = 2

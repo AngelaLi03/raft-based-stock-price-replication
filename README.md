@@ -13,7 +13,7 @@ Raft is the algorithm behind the consistency guarantees of systems like etcd (Ku
 - **Protocol Buffers** for wire format / service definitions (`proto/raft.proto`, `proto/client.proto`)
 - **Docker Compose** for local cluster orchestration (15-node by default, generated — see `scripts/gen_docker_compose.py`)
 - **Prometheus client** for metrics export (added in the in-progress Week 4 work)
-- **pytest** + `pytest-asyncio` for the test suite (165 tests, ~4,300 lines across 16 files)
+- **pytest** + `pytest-asyncio` for the test suite (157 tests, ~4,100 lines across 15 files)
 
 ## Concurrency Model
 
@@ -72,7 +72,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 - KV state machine (`kv/state_machine.py`) — in-memory store with periodic snapshotting, idempotent command application
 - `PutPrice` / `BatchPutPrice` / `GetPrice` / `GetClusterInfo` — implemented and replicated correctly
 - 15-node cluster (`scripts/gen_docker_compose.py --nodes N`), verified live via `docker compose up` — see "15-Node Verification" below
-- **Full test suite passes**: 165 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice + 5 for the gRPC/metrics-server layer + 5 for benchmark.py/chaos_test.py importability + 4 for the InstallSnapshot boundary and next_index overshoot bugs + 1 for the node-role metric + 3 for role/state metrics on followers + 1 for election-duration recording + 3 for the candidate-role callback wiring), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility
+- **Full test suite passes**: 157 tests (129 pre-existing/fixed + 11 for snapshotting + 3 for BatchPutPrice + 5 for the gRPC/metrics-server layer + 5 for benchmark.py/chaos_test.py importability + 4 for the InstallSnapshot boundary and next_index overshoot bugs), verified by actually running `pytest` after installing `requirements.txt` into a working venv — not just read for plausibility. (The Grafana/Prometheus monitoring feature described below under "Fixed this session" #15-16 exists as a real, live-verified, unmerged branch — `worktree-grafana-dashboards-alerting` — with its own additional tests; only its documentation has been synced here, not its code, so this count doesn't include those tests.)
 
 ### Fixed this session
 1. **Leader-election safety gap** (was the single highest-priority correctness bug): vote granting now checks that the candidate's log is at least as up-to-date as the voter's before granting (`raft/election.py:_is_log_up_to_date`, implementing Raft §5.4.1), and candidates advertise their real `last_log_index`/`last_log_term` (from `RaftNode._get_last_log_info`, backed by storage) instead of hardcoded zeros.
@@ -109,6 +109,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 16. **Two more bugs found during a live guided demo (`scripts/dashboard_demo.py`) *after* the above was already merged and "done"** — both in the demo tooling, not the monitoring stack itself, but worth recording because of what they reveal: passing review and passing your own first live run are not the same bar.
     - The demo script's alert-state checker crashed (`AttributeError: 'str' object has no attribute 'get'`) parsing a Grafana 401 (stale credentials — the admin password had been changed via the UI mid-session) as if it were a normal alert list, mid-scenario, with 8 real containers already stopped. Fixed to check the response status/shape before iterating it. Grafana admin password reset back to `admin`/`admin` (`grafana cli admin reset-admin-password admin`) to match what the README documents.
     - **The more interesting one**: the quorum-loss demo scenario stopped a *fixed* set of 8 node IDs regardless of who currently held leadership. When the actual leader happened to survive in the remaining 7, the "no leader" alert correctly never fired — because Raft, as implemented here (this is correct behavior, not a bug), has no lease/step-down-on-isolation mechanism: a leader cut off from the majority keeps believing and reporting itself as leader indefinitely, it just can't commit anything. Fixed the demo scenario to always include the current leader in the set of nodes it stops. Live-verified after the fix: the alert transitions `Normal → active → Normal` exactly as expected. Worth knowing as an operational fact about this system, not just a demo-script bug — see Known Issues below.
+17. **`scripts/gen_protos.sh` used `sed -i ''` — BSD/macOS-only syntax, silently broken on every Linux machine**: GNU sed (Linux, including every GitHub Actions runner) parses the empty string after `-i` as the sed *script* itself and the real script argument as a *filename* — it doesn't error, it just does the wrong thing or fails confusingly. This had been broken since the script was first written; invisible for the project's entire life because all prior development and testing happened on macOS. Found by the very first live CI run on `ubuntu-latest` (see "Continuous Integration" below), which failed at the "Regenerate protobuf stubs" step within minutes of the workflow existing — exactly the kind of bug this feature exists to catch. Fixed by dropping `-i` entirely in favor of `sed '...' file > file.tmp && mv file.tmp file`, which is standard POSIX behavior identical on both BSD and GNU sed — not a Linux-specific workaround that would have traded one platform's breakage for the other's.
 
 ### Known issues still open
 1. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
@@ -151,7 +152,25 @@ bash scripts/gen_protos.sh
 PYTHONPATH=. pytest tests/ -v
 ```
 
-165 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+157 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and on every PR targeting `main`:
+
+- **`test`** — installs `requirements.txt`, regenerates protobuf stubs with the pinned toolchain (`scripts/gen_protos.sh`), runs the full `pytest` suite.
+- **`lint`** — runs `ruff check .` (`ruff.toml` pins the rule set to `E4`/`E7`/`E9`/`F` and excludes generated protobuf files).
+- **`docker-build-push`** — depends on both `test` and `lint` passing. Builds `ops/Dockerfile` on every push/PR (catches a broken Dockerfile before merge); on pushes to `main` only, also publishes `ghcr.io/angelali03/raft-node:latest` and `:<git-sha>`.
+
+### Enabling required status checks (one-time, manual)
+
+GitHub branch protection isn't configurable from a workflow file — this is a one-time repo setting:
+
+1. GitHub repo → Settings → Branches → Add branch protection rule
+2. Branch name pattern: `main`
+3. Enable "Require status checks to pass before merging"
+4. Select `test` and `lint` as required checks
+5. Save
 
 ## Running the Cluster
 
@@ -257,6 +276,9 @@ Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # test, lint, docker-build-push (GHCR, main only)
 ├── proto/                     # Protobuf service definitions
 │   ├── raft.proto             # Raft internal RPCs
 │   └── client.proto           # Client-facing RPCs
@@ -281,10 +303,11 @@ Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -
 │   ├── benchmark.py            # Load benchmark (import + mixed-workload race fixed, live verification partial)
 │   ├── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
 │   └── dashboard_demo.py       # Narrated live demo of the monitoring stack (failover, quorum loss, flapping)
-├── tests/                      # 16 files, ~4,300 lines, 165 tests, all passing
+├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
 │   ├── docker-compose.monitoring.yml  # Prometheus + Grafana, joins raft-network
 │   └── monitoring/             # Prometheus scrape config, Grafana datasource/dashboard/alert provisioning
+├── ruff.toml                   # Lint rule set (E4/E7/E9/F), excludes generated protobuf files
 └── README.md
 ```
 
@@ -319,7 +342,7 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 ## Future Roadmap (not started)
 
 - **Live Data Integration**: real-time price ingestion (`ingestor/feeder.py`), external API integration (Yahoo Finance / Alpha Vantage), automatic leader discovery/redirect, batch ingestion
-- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, CI/CD
+- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status
 
 ## Additional Resources
 
