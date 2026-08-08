@@ -180,7 +180,14 @@ class PrometheusMetrics:
             ['node_id'],
             registry=self.registry
         )
-        
+
+        self.node_role = Gauge(
+            'raft_node_role',
+            'Current node role (0=follower, 1=candidate, 2=leader)',
+            ['node_id'],
+            registry=self.registry
+        )
+
         # Batch metrics
         self.batch_size = Gauge(
             'raft_batch_size',
@@ -282,7 +289,12 @@ class PrometheusMetrics:
         self.commit_index.labels(node_id=self.node_id).set(commit_index)
         self.last_applied.labels(node_id=self.node_id).set(last_applied)
         self.log_length.labels(node_id=self.node_id).set(log_length)
-    
+
+    def update_node_role(self, role: str) -> None:
+        """Update node role metric (0=follower, 1=candidate, 2=leader)."""
+        role_values = {"follower": 0, "candidate": 1, "leader": 2}
+        self.node_role.labels(node_id=self.node_id).set(role_values[role])
+
     def update_batch_size(self, size: int) -> None:
         """Update batch size metric."""
         self.batch_size.labels(node_id=self.node_id).set(size)
@@ -409,6 +421,12 @@ def update_node_state(term: int, commit_index: int, last_applied: int, log_lengt
     """Update node state metrics."""
     if _prometheus_metrics:
         _prometheus_metrics.update_node_state(term, commit_index, last_applied, log_length)
+
+
+def update_node_role(role: str) -> None:
+    """Update node role metric."""
+    if _prometheus_metrics:
+        _prometheus_metrics.update_node_role(role)
 
 
 def update_batch_size(size: int) -> None:

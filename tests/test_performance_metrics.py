@@ -141,16 +141,29 @@ class TestPrometheusMetrics:
     def test_node_state_update(self):
         """Test node state metrics update."""
         metrics = PrometheusMetrics("test_node", port=0)
-        
+
         # Update node state
         metrics.update_node_state(term=5, commit_index=100, last_applied=95, log_length=105)
-        
+
         # Check that metrics were updated
         assert metrics.current_term.labels(node_id="test_node")._value.get() == 5
         assert metrics.commit_index.labels(node_id="test_node")._value.get() == 100
         assert metrics.last_applied.labels(node_id="test_node")._value.get() == 95
         assert metrics.log_length.labels(node_id="test_node")._value.get() == 105
-    
+
+    def test_node_role_update(self):
+        """Test node role metric update."""
+        metrics = PrometheusMetrics("test_node", port=0)
+
+        metrics.update_node_role("follower")
+        assert metrics.node_role.labels(node_id="test_node")._value.get() == 0
+
+        metrics.update_node_role("candidate")
+        assert metrics.node_role.labels(node_id="test_node")._value.get() == 1
+
+        metrics.update_node_role("leader")
+        assert metrics.node_role.labels(node_id="test_node")._value.get() == 2
+
     def test_batch_metrics(self):
         """Test batch-related metrics."""
         metrics = PrometheusMetrics("test_node", port=0)
@@ -228,7 +241,7 @@ class TestPrometheusMetrics:
             record_election, record_replication, record_commit,
             record_leader_change, record_crash_recovery, record_catchup,
             record_storage_write, record_command_applied, update_kv_entries,
-            update_node_state, update_batch_size, record_batch_flush
+            update_node_state, update_node_role, update_batch_size, record_batch_flush
         )
         
         # These should not raise exceptions
@@ -242,6 +255,7 @@ class TestPrometheusMetrics:
         record_command_applied()
         update_kv_entries(20)
         update_node_state(1, 10, 8, 12)
+        update_node_role("leader")
         update_batch_size(5)
         record_batch_flush()
     
