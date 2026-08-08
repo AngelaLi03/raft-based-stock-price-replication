@@ -1,0 +1,19 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: raft-prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - raft-network
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+
+networks:
+  raft-network:
+    external: true
