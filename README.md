@@ -141,6 +141,24 @@ PYTHONPATH=. pytest tests/ -v
 
 157 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
 
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and on every PR targeting `main`:
+
+- **`test`** — installs `requirements.txt`, regenerates protobuf stubs with the pinned toolchain (`scripts/gen_protos.sh`), runs the full `pytest` suite.
+- **`lint`** — runs `ruff check .` (`ruff.toml` pins the rule set to `E4`/`E7`/`E9`/`F` and excludes generated protobuf files).
+- **`docker-build-push`** — depends on both `test` and `lint` passing. Builds `ops/Dockerfile` on every push/PR (catches a broken Dockerfile before merge); on pushes to `main` only, also publishes `ghcr.io/angelali03/raft-node:latest` and `:<git-sha>`.
+
+### Enabling required status checks (one-time, manual)
+
+GitHub branch protection isn't configurable from a workflow file — this is a one-time repo setting:
+
+1. GitHub repo → Settings → Branches → Add branch protection rule
+2. Branch name pattern: `main`
+3. Enable "Require status checks to pass before merging"
+4. Select `test` and `lint` as required checks
+5. Save
+
 ## Running the Cluster
 
 ```bash
@@ -224,6 +242,9 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # test, lint, docker-build-push (GHCR, main only)
 ├── proto/                     # Protobuf service definitions
 │   ├── raft.proto             # Raft internal RPCs
 │   └── client.proto           # Client-facing RPCs
@@ -249,6 +270,7 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 │   └── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
 ├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
+├── ruff.toml                   # Lint rule set (E4/E7/E9/F), excludes generated protobuf files
 └── README.md
 ```
 
@@ -283,7 +305,7 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 ## Future Roadmap (not started)
 
 - **Live Data Integration**: real-time price ingestion (`ingestor/feeder.py`), external API integration (Yahoo Finance / Alpha Vantage), automatic leader discovery/redirect, batch ingestion
-- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, Grafana integration for metrics, CI/CD
+- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status
 
 ## Additional Resources
 
