@@ -77,9 +77,19 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ## 📈 Metrics Tracked
 
-- Elections, commits, replication latency
+- Elections, election duration, commits, replication latency
+- Node role (follower/candidate/leader), current term
 - Crash recoveries, batch flushes
 - Storage reads/writes, commands applied
+
+## 📊 Monitoring Stack (Grafana + Prometheus)
+
+- **Separate compose file** (`docker-compose.monitoring.yml`), provisioned entirely as code — datasource, dashboard, alerts, no manual UI setup
+- **Prometheus** `:9090` scrapes all nodes; **Grafana** `:3000` (`admin`/`admin`)
+- **6-panel dashboard**, 5s refresh: role per node, term per node, leader changes, election duration, per-follower commit lag, quorum health
+- **2 alerts**, visual-only: no leader >10s, leader flapping >2 changes/60s
+- **Key gotcha**: `count(x == 2)` returns *no data* (not 0) on zero matches — used `sum(x == bool 2)` instead so the no-leader alert can actually fire on the case it exists for
+- **`scripts/dashboard_demo.py`**: narrated live demo — failover, quorum loss, flapping — watchable on the dashboard in real time
 
 ## 🎤 Common Interview Questions
 
@@ -94,6 +104,9 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ### "How do you ensure consistency?"
 **Answer**: "Single leader for writes, majority commit rule, log matching property enforced, atomic disk writes, and all nodes apply same entries in same order."
+
+### "How do you monitor it?"
+**Answer**: "Grafana + Prometheus, provisioned as code. Found a real bug testing the alerting itself: `count(role==2)` returns no data (not 0) when no leader exists, which Grafana treats as a separate non-firing state — fixed with `sum(role == bool 2)` so it always returns a real number. I don't trust an alert until I've actually stopped a node and watched it fire and resolve."
 
 ## 🔑 Key Design Decisions
 
@@ -137,7 +150,7 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 - **Scalability**:** "The system can scale horizontally by adding more nodes. Batching ensures we maintain performance as cluster size grows."
 - **Reliability**:** "Comprehensive crash recovery ensures zero data loss. Atomic writes and fsync guarantee durability even during power failures."
-- **Observability**:** "Prometheus metrics and structured logging enable production debugging. We can identify bottlenecks and detect issues before they impact users."
+- **Observability**:** "Prometheus metrics and structured logging enable production debugging, and a Grafana dashboard + alert rules (provisioned as code, live-verified by actually triggering them) mean issues get noticed automatically, not just debuggable after the fact."
 - **Consistency**:** "Strong consistency is critical for financial data. Raft's linearizability guarantees ensure all nodes see the same data in the same order."
 
 ---
