@@ -74,7 +74,8 @@ class RaftNode:
             request_vote_callback=self._request_vote_from_peer,
             become_leader_callback=self._on_become_leader,
             become_follower_callback=self._on_become_follower,
-            get_last_log_info_callback=self._get_last_log_info
+            get_last_log_info_callback=self._get_last_log_info,
+            become_candidate_callback=self._on_become_candidate
         )
         
         # Current state
@@ -322,6 +323,11 @@ class RaftNode:
 
         except Exception as e:
             logger.warning(f"Failed to install snapshot on {peer.node_id}: {e}")
+
+    async def _on_become_candidate(self) -> None:
+        """Called when this node becomes candidate."""
+        self.state = RaftState.CANDIDATE
+        self._record_state_metrics()
 
     async def _on_become_leader(self) -> None:
         """Called when this node becomes leader."""

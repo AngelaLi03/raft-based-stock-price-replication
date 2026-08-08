@@ -213,6 +213,22 @@ async def test_record_state_metrics_sets_role_and_state_gauges(raft_node):
 
 
 @pytest.mark.asyncio
+async def test_on_become_candidate_sets_state_and_role_gauge(raft_node):
+    """_on_become_candidate should set state to CANDIDATE and update the
+    role gauge to 1 - same pattern as
+    test_record_state_metrics_sets_role_and_state_gauges, but exercising the
+    callback wired up from ElectionManager rather than calling
+    _record_state_metrics() directly."""
+    await raft_node._on_become_candidate()
+
+    assert raft_node.state == RaftState.CANDIDATE
+
+    from raft.prometheus_metrics import get_prometheus_metrics
+    metrics = get_prometheus_metrics()
+    assert metrics.node_role.labels(node_id="node1")._value.get() == 1
+
+
+@pytest.mark.asyncio
 async def test_record_state_metrics_reports_follower_role(raft_node):
     """A follower (the default state, never set to LEADER) must still report
     role=0 and its own state gauges - this is the gap being fixed."""
