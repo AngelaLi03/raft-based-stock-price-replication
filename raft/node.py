@@ -90,6 +90,7 @@ class RaftNode:
         self.pending_entries: List[LogEntry] = []
         self._pending_futures: Dict[int, asyncio.Future] = {}  # log index -> future resolved on flush
         self.batch_flush_task: Optional[asyncio.Task] = None
+        self.metrics_tick_task: Optional[asyncio.Task] = None
         self.batch_lock = asyncio.Lock()
         
         # gRPC server references (set by server)
@@ -155,7 +156,9 @@ class RaftNode:
         
         # Start as follower with election timeout
         self.election_manager.start_election_timeout()
-        
+
+        self.metrics_tick_task = asyncio.create_task(self._metrics_tick_loop())
+
         logger.info(f"Raft node {self.node_id} started as {self.state.value} (recovery complete)")
     
     async def stop(self) -> None:
@@ -165,7 +168,14 @@ class RaftNode:
         # Stop election timeout and heartbeats
         self.election_manager.stop_election_timeout()
         self.election_manager.stop_heartbeat()
-        
+
+        if self.metrics_tick_task:
+            self.metrics_tick_task.cancel()
+            try:
+                await self.metrics_tick_task
+            except asyncio.CancelledError:
+                pass
+
         # Stop KV state machine
         await self.kv_state_machine.stop()
         
@@ -349,6 +359,7 @@ class RaftNode:
             )
         
         logger.info(f"Node {self.node_id} became leader for term {self.election_manager.current_term}")
+        self._record_state_metrics()
     
     async def _on_become_follower(self) -> None:
         """Called when this node becomes follower."""
@@ -375,6 +386,7 @@ class RaftNode:
             self._pending_futures.clear()
 
         logger.info(f"Node {self.node_id} became follower")
+        self._record_state_metrics()
     
     # Batching methods
     
@@ -922,25 +934,39 @@ class RaftNode:
         
         return entry.term == prev_log_term
     
+    def _record_state_metrics(self) -> None:
+        """Refresh this node's role and state gauges from current in-memory state."""
+        try:
+            from raft.prometheus_metrics import update_node_state, update_node_role
+            update_node_state(
+                self.election_manager.current_term,
+                self.commit_index,
+                self.last_applied,
+                self.storage.get_last_log_index()
+            )
+            update_node_role(self.state.value)
+        except ImportError:
+            pass
+
+    async def _metrics_tick_loop(self) -> None:
+        """Periodically refresh state metrics for this node regardless of
+        role - unlike the heartbeat loop, this runs on followers too."""
+        while True:
+            try:
+                self._record_state_metrics()
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in metrics tick loop: {e}")
+                await asyncio.sleep(2.0)
+
     async def _heartbeat_loop(self) -> None:
         """Send heartbeats to all followers."""
         from .types import HEARTBEAT_INTERVAL
-        
+
         while self.state == RaftState.LEADER:
             try:
-                # Update node state metrics
-                try:
-                    from raft.prometheus_metrics import update_node_state
-                    log_length = self.storage.get_last_log_index()
-                    update_node_state(
-                        self.election_manager.current_term,
-                        self.commit_index,
-                        self.last_applied,
-                        log_length
-                    )
-                except ImportError:
-                    pass
-                
                 # Send heartbeats to all peers
                 heartbeat_tasks = []
                 for peer in self.peers:

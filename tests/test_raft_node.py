@@ -179,7 +179,7 @@ async def test_get_price(raft_node):
 def test_get_state_info(raft_node):
     """Test getting state info."""
     info = raft_node.get_state_info()
-    
+
     assert info["node_id"] == "node1"
     assert info["state"] == "follower"
     assert info["current_term"] == 0
@@ -188,3 +188,56 @@ def test_get_state_info(raft_node):
     assert info["last_applied"] == 0
     assert info["log_length"] == 0
     assert len(info["peers"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_record_state_metrics_sets_role_and_state_gauges(raft_node):
+    """_record_state_metrics should update both the role gauge and the
+    term/commit/applied/log-length gauges from the node's current state,
+    regardless of whether this node is a leader or follower."""
+    raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 3
+    raft_node.commit_index = 5
+    raft_node.last_applied = 5
+    raft_node.storage.get_last_log_index = MagicMock(return_value=5)
+
+    raft_node._record_state_metrics()
+
+    from raft.prometheus_metrics import get_prometheus_metrics
+    metrics = get_prometheus_metrics()
+    assert metrics.node_role.labels(node_id="node1")._value.get() == 2
+    assert metrics.current_term.labels(node_id="node1")._value.get() == 3
+    assert metrics.commit_index.labels(node_id="node1")._value.get() == 5
+    assert metrics.last_applied.labels(node_id="node1")._value.get() == 5
+    assert metrics.log_length.labels(node_id="node1")._value.get() == 5
+
+
+@pytest.mark.asyncio
+async def test_record_state_metrics_reports_follower_role(raft_node):
+    """A follower (the default state, never set to LEADER) must still report
+    role=0 and its own state gauges - this is the gap being fixed."""
+    raft_node.election_manager.current_term = 2
+    raft_node.commit_index = 7
+    raft_node.last_applied = 6
+    raft_node.storage.get_last_log_index = MagicMock(return_value=7)
+
+    raft_node._record_state_metrics()
+
+    from raft.prometheus_metrics import get_prometheus_metrics
+    metrics = get_prometheus_metrics()
+    assert metrics.node_role.labels(node_id="node1")._value.get() == 0
+    assert metrics.commit_index.labels(node_id="node1")._value.get() == 7
+
+
+@pytest.mark.asyncio
+async def test_metrics_tick_task_starts_on_start_and_cancels_on_stop(raft_node):
+    """The periodic tick must run independent of role (started in start(),
+    not tied to becoming leader) and must be cleanly cancelled on stop()."""
+    await raft_node.start()
+
+    assert raft_node.metrics_tick_task is not None
+    assert not raft_node.metrics_tick_task.done()
+
+    await raft_node.stop()
+
+    assert raft_node.metrics_tick_task.cancelled()
