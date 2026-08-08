@@ -14,7 +14,7 @@
 - Generated protobuf files (`raft/proto/*_pb2.py`, `raft/proto/*_pb2_grpc.py`, `client/proto/*_pb2.py`, `client/proto/*_pb2_grpc.py`) are excluded from lint entirely — never hand-fix generated code.
 - Docker image pushes only on `push` to `main`; PRs and other branches build-only (no push), and GHCR is the only registry — no Docker Hub, no new secrets to configure.
 - Python 3.11 in every job that needs it — matches the pinned `grpcio==1.59.0`, which has no Python 3.13 wheel.
-- Full test suite (165 tests) must stay green throughout every task in this plan.
+- Full test suite (157 tests) must stay green throughout every task in this plan.
 - This plan executes in an isolated git worktree/branch (never on `main` directly), following this repo's established convention. Commit normally at the end of each task inside the worktree.
 - **Pushing this branch to `origin` (required to verify GitHub Actions actually runs — Actions doesn't execute on purely local commits) needs explicit go-ahead before it happens** — standing rule for this repo this session. Everything through Task 3 is committed locally only; Task 4 is the push and must not be dispatched without the user's explicit confirmation first.
 
@@ -28,7 +28,7 @@
 - Modify (lint fixes only, no behavior change): `kv/state_machine.py`, `raft/node.py`, `raft/prometheus_metrics.py`, `raft/storage.py`, `raft/structured_logging.py`, `raft/types.py`, `scripts/benchmark.py`, `scripts/chaos_test.py`, `server/metrics_server.py`, `tests/test_batch_replication.py`, `tests/test_chaos_recovery.py`, `tests/test_crash_recovery.py`, `tests/test_election.py`, `tests/test_idempotent_apply.py`, `tests/test_kv_apply.py`, `tests/test_performance_metrics.py`, `tests/test_persistence.py`, `tests/test_raft_node.py`, `tests/test_replication.py`, `tests/test_snapshotting.py`, `tests/test_structured_logging.py`
 
 **Interfaces:**
-- Produces: a repo where `ruff check .` exits 0 (matches what Task 2's `lint` job will run) and `PYTHONPATH=. pytest tests/ -v` still shows 165 passed.
+- Produces: a repo where `ruff check .` exits 0 (matches what Task 2's `lint` job will run) and `PYTHONPATH=. pytest tests/ -v` still shows 157 passed.
 
 - [ ] **Step 1: Create `ruff.toml`**
 
@@ -98,7 +98,7 @@ Expected: `All checks passed!`
 PYTHONPATH=. pytest tests/ -v
 ```
 
-Expected: 165 passed. If anything fails, an import removed in Step 4/5 was not actually unused — investigate the specific failure, don't just revert broadly.
+Expected: 157 passed. If anything fails, an import removed in Step 4/5 was not actually unused — investigate the specific failure, don't just revert broadly.
 
 - [ ] **Step 8: Commit**
 

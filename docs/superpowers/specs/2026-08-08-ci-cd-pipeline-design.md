@@ -87,7 +87,7 @@ Plus fixes to the ~47 real lint violations across existing `raft/`, `kv/`, `serv
 2. Deliberately break something in a scratch commit (e.g. reintroduce an unused import) on the branch, push, confirm `lint` actually fails red — then revert and confirm it goes green again. Same check for `test` (temporarily break an assertion).
 3. Merge to `main`, confirm `docker-build-push` actually pushes an image, and confirm it's visible at `ghcr.io/angelali03/raft-node`.
 4. Manually enable branch protection per the documented steps, then confirm (e.g. via a throwaway PR) that GitHub actually blocks merging until checks pass.
-5. Full existing test suite (165 tests) still green — this feature must not change any test behavior, only add infrastructure around running them.
+5. Full existing test suite (157 tests) still green — this feature must not change any test behavior, only add infrastructure around running them.
 
 ## Rollout / git hygiene
 
