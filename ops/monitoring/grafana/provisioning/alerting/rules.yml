@@ -1,0 +1,84 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: raft-no-leader-alerts
+    folder: Raft Cluster
+    interval: 10s
+    rules:
+      - uid: raft-no-leader
+        title: No leader elected
+        condition: C
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No node in the cluster currently reports role=leader"
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 60
+              to: 0
+            model:
+              expr: sum(raft_node_role == bool 2)
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C
+
+  - orgId: 1
+    name: raft-leader-flapping-alerts
+    folder: Raft Cluster
+    interval: 10s
+    rules:
+      - uid: raft-leader-flapping
+        title: Leader changing too frequently
+        condition: C
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 2 leader changes in the last 60s - possible instability"
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 60
+              to: 0
+            model:
+              expr: sum(increase(raft_leader_changes_total[60s]))
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [2]
+              refId: C
