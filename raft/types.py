@@ -4,8 +4,7 @@ Raft types, enums, and constants.
 
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
-import time
+from typing import Dict, Any
 
 
 class RaftState(Enum):

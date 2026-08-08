@@ -98,6 +98,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
 14. **Two more, more serious bugs found *while re-verifying #13* — both only reachable under conditions the live 15-node cluster could produce and unit tests couldn't**:
     - **Critical: an infinite `InstallSnapshot` retry loop that permanently broke writes.** Once any follower fell behind past a snapshot boundary (normal once `RAFT_SNAPSHOT_THRESHOLD`, default 50, is crossed — not a rare edge case), the leader got stuck forever re-sending `InstallSnapshot` to that follower on every heartbeat. Root cause: the snapshot boundary entry isn't reachable via `get_log_entry` (it's compacted, only recorded in the snapshot), but both the follower's log-matching check and the leader's `prev_log_term` computation assumed it was — so the very first `AppendEntries` after a successful snapshot install always failed, `next_index` got knocked back onto the boundary, and the leader re-sent the same snapshot again. Live symptom: leader logs looping `"Installed snapshot on nodeX"` across every peer, and **every write failing** with "Replication failed" — this is almost certainly also why the *first* `chaos_test.py` attempt (before this fix) looked stuck. Fixed with a new `RaftStorage.get_term_at_index()` helper applied at all three affected call sites (log matching, both `prev_log_term` computations, and `_update_commit_index`'s majority-term check, which had the identical blind spot). 3 new regression tests in `tests/test_snapshotting.py`.
     - **A second, subtler bug the fix above unmasked: `next_index` could overshoot past what a follower actually has, under concurrent writes.** `_flush_pending_entries`'s lock only protects the batch snapshot, not the network round trip, so two flushes for the same peer can genuinely be in flight simultaneously. The old update — `next_index[peer] = len(entries) + next_index[peer]` — read whatever `next_index` *currently* held at response time; if a second, already-superseded success response landed after a newer one had already advanced it, it added its own `len(entries)` on top, double-counting. Confirmed live via temporary diagnostic logging: leader sending `prev_log_index=15` while every follower actually only had 10 entries. Fixed by computing the update as an absolute value from *that RPC's own* `prev_log_index` and only ever moving `next_index`/`match_index` forward (`max(...)`, never regress) — applied to both the batch-flush and heartbeat-catch-up paths. 1 new regression test using `asyncio.gather` to force the actual race (a sequential-await test would not have reproduced it — the second call would just see the first's already-updated value). Verified live: write error rate went from 50% → 0% on the same benchmark that first exposed it; a small residual (3-10%) remains only under sustained high concurrency (10+ concurrent writers) and traces to normal, expected Raft retry behavior (a follower transiently one entry behind, self-healing next round) rather than a bug — confirmed safe (no corruption, cleanly rolled back, client correctly told `ok=False`), just not automatically retried, which is a possible future enhancement, not a defect.
+15. **`scripts/gen_protos.sh` used `sed -i ''` — BSD/macOS-only syntax, silently broken on every Linux machine**: GNU sed (Linux, including every GitHub Actions runner) parses the empty string after `-i` as the sed *script* itself and the real script argument as a *filename* — it doesn't error, it just does the wrong thing or fails confusingly. This had been broken since the script was first written; invisible for the project's entire life because all prior development and testing happened on macOS. Found by the very first live CI run on `ubuntu-latest` (see "Continuous Integration" below), which failed at the "Regenerate protobuf stubs" step within minutes of the workflow existing — exactly the kind of bug this feature exists to catch. Fixed by dropping `-i` entirely in favor of `sed '...' file > file.tmp && mv file.tmp file`, which is standard POSIX behavior identical on both BSD and GNU sed — not a Linux-specific workaround that would have traded one platform's breakage for the other's.
 
 ### Known issues still open
 1. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
@@ -140,6 +141,24 @@ PYTHONPATH=. pytest tests/ -v
 ```
 
 157 tests, ~3.8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and on every PR targeting `main`:
+
+- **`test`** — installs `requirements.txt`, regenerates protobuf stubs with the pinned toolchain (`scripts/gen_protos.sh`), runs the full `pytest` suite.
+- **`lint`** — runs `ruff check .` (`ruff.toml` pins the rule set to `E4`/`E7`/`E9`/`F` and excludes generated protobuf files).
+- **`docker-build-push`** — depends on both `test` and `lint` passing. Builds `ops/Dockerfile` on every push/PR (catches a broken Dockerfile before merge); on pushes to `main` only, also publishes `ghcr.io/angelali03/raft-node:latest` and `:<git-sha>`.
+
+### Enabling required status checks (one-time, manual)
+
+GitHub branch protection isn't configurable from a workflow file — this is a one-time repo setting:
+
+1. GitHub repo → Settings → Branches → Add branch protection rule
+2. Branch name pattern: `main`
+3. Enable "Require status checks to pass before merging"
+4. Select `test` and `lint` as required checks
+5. Save
 
 ## Running the Cluster
 
@@ -224,6 +243,9 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # test, lint, docker-build-push (GHCR, main only)
 ├── proto/                     # Protobuf service definitions
 │   ├── raft.proto             # Raft internal RPCs
 │   └── client.proto           # Client-facing RPCs
@@ -249,6 +271,7 @@ PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 510
 │   └── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
 ├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
+├── ruff.toml                   # Lint rule set (E4/E7/E9/F), excludes generated protobuf files
 └── README.md
 ```
 
@@ -283,7 +306,7 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 ## Future Roadmap (not started)
 
 - **Live Data Integration**: real-time price ingestion (`ingestor/feeder.py`), external API integration (Yahoo Finance / Alpha Vantage), automatic leader discovery/redirect, batch ingestion
-- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, Grafana integration for metrics, CI/CD
+- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status
 
 ## Additional Resources
 

@@ -12,7 +12,6 @@ import subprocess
 import sys
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 
 # Add project root to path
 sys.path.insert(0, '.')

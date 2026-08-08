@@ -5,7 +5,6 @@ Tests for Raft log replication and commit logic.
 import pytest
 import asyncio
 import tempfile
-import os
 from unittest.mock import AsyncMock, MagicMock
 
 from raft.types import PeerInfo, RaftState, LogEntry

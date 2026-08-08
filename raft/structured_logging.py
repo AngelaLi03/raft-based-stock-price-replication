@@ -5,7 +5,7 @@ Structured logging utilities for Raft cluster observability.
 import logging
 import json
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
 

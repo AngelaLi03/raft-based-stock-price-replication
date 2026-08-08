@@ -2,10 +2,6 @@
 Tests for performance metrics functionality.
 """
 
-import pytest
-import time
-from unittest.mock import Mock, patch
-from prometheus_client import CollectorRegistry
 
 from raft.prometheus_metrics import PrometheusMetrics, init_prometheus_metrics, get_prometheus_metrics
 

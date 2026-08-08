@@ -9,9 +9,8 @@ import logging
 import time
 import statistics
 import sys
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 import json
 
 # Add project root to path
@@ -504,7 +503,7 @@ async def main():
         await runner.setup()
         
         # Run benchmarks
-        results = await runner.run_all_benchmarks(args.operations, args.concurrency)
+        await runner.run_all_benchmarks(args.operations, args.concurrency)
         
         # Print results
         runner.print_results()
