@@ -2,7 +2,6 @@
 HTTP server for Prometheus metrics endpoint.
 """
 
-import asyncio
 import logging
 from aiohttp import web, web_request, web_response
 from typing import Optional

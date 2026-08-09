@@ -2,11 +2,9 @@
 Tests for structured logging functionality.
 """
 
-import pytest
 import json
 import logging
 from unittest.mock import Mock, patch
-from io import StringIO
 
 from raft.structured_logging import (
     StructuredLogger, StructuredFormatter, LogContext, LogLevel,
@@ -31,23 +29,6 @@ class TestStructuredLogging:
             duration_ms=25.5
         )
         
-        # Test to_dict conversion
-        context_dict = {
-            "node_id": "node1",
-            "term": 5,
-            "role": "leader",
-            "commit_index": 100,
-            "last_applied": 95,
-            "log_length": 105,
-            "batch_size": 10,
-            "peer_id": None,
-            "operation": "replication",
-            "duration_ms": 25.5,
-            "error_message": None
-        }
-        
-        # Note: asdict would be used in actual implementation
-        # This is a simplified test
         assert context.node_id == "node1"
         assert context.term == 5
         assert context.role == "leader"
@@ -328,10 +309,6 @@ class TestStructuredLogging:
     
     def test_setup_structured_logging(self):
         """Test structured logging setup."""
-        # Capture log output
-        log_capture = StringIO()
-        handler = logging.StreamHandler(log_capture)
-        
         with patch('logging.getLogger') as mock_get_logger:
             mock_logger = Mock()
             mock_logger.handlers = []

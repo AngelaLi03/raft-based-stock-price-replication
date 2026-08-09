@@ -6,8 +6,6 @@ import pytest
 import asyncio
 import tempfile
 import json
-import time
-from unittest.mock import patch
 
 from kv.state_machine import KVStateMachine, TickerPrice, Command, serialize_put_command, serialize_batch_put_command
 
