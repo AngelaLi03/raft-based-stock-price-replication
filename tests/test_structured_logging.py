@@ -28,7 +28,6 @@ class TestStructuredLogging:
             operation="replication",
             duration_ms=25.5
         )
-        
         assert context.node_id == "node1"
         assert context.term == 5
         assert context.role == "leader"

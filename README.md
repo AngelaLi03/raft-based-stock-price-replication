@@ -114,6 +114,7 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
     - **Election storms: one down peer could push heartbeat delivery to *healthy* peers past their election timeout.** `_heartbeat_loop` awaited `asyncio.gather()` over every peer before sleeping, so its actual cadence was `max(peer_response_time) + HEARTBEAT_INTERVAL` (75ms), not a flat 75ms. With `ELECTION_TIMEOUT_MIN` at only 150ms, one persistently down peer's per-cycle failure latency was enough to occasionally delay heartbeats to everyone else too. Live-observed as a genuine election storm: with one node down for an extended period, cluster term climbed by 100+ in minutes, settling within ~10s of restoring the node — this had been masked by the RPC-hang bug above (once RPCs failed fast instead of hanging forever, the loop could retry every cycle, making the effect visible for the first time). Fixed by firing each peer's heartbeat without awaiting it before the loop's sleep, so cadence to healthy peers no longer depends on a slow/down peer's latency.
     - **A write could be acked `ok=True` and then still vanish.** `_flush_pending_entries()` computed success from `_replicate_to_peers()`'s majority-ACK count alone, but `_update_commit_index()` — the only thing that actually advances `commit_index` — silently no-ops once `self.state != RaftState.LEADER`. If this node stepped down between `_replicate_to_peers()` returning and the success check (real election timing, not contrived), the entry was majority-replicated on peers' raw logs but never actually committed, and the client was still told `ok=True` — data that the next elected leader can then freely overwrite via normal log-matching. Live-observed: a leader reported `ok=True` for two writes that were then missing from *every* node, including itself. Fixed by checking `state == LEADER` after `_update_commit_index()` before reporting success; if leadership was lost, the batch is truncated and the futures resolve `False`, same as the existing replication-failure path.
     - **Status: partially live-verified.** All three have fast, deterministic regression tests that reproduce the exact failure and prove the fix (169 tests total). The first two were also confirmed live: post-fix runs showed no more stuck candidates and term counts staying low and stable instead of climbing into the hundreds. The third has strong unit-test evidence but wasn't independently reconfirmed via a full clean `chaos_test.py` run — see Known Issue #6 below, which is what cut that verification pass short.
+18. **`scripts/gen_protos.sh` used `sed -i ''` — BSD/macOS-only syntax, silently broken on every Linux machine**: GNU sed (Linux, including every GitHub Actions runner) parses the empty string after `-i` as the sed *script* itself and the real script argument as a *filename* — it doesn't error, it just does the wrong thing or fails confusingly. This had been broken since the script was first written; invisible for the project's entire life because all prior development and testing happened on macOS. Found by the very first live CI run on `ubuntu-latest` (see "Continuous Integration" below), which failed at the "Regenerate protobuf stubs" step within minutes of the workflow existing — exactly the kind of bug this feature exists to catch. Fixed by dropping `-i` entirely in favor of `sed '...' file > file.tmp && mv file.tmp file`, which is standard POSIX behavior identical on both BSD and GNU sed — not a Linux-specific workaround that would have traded one platform's breakage for the other's.
 
 ### Known issues still open
 1. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
@@ -158,6 +159,24 @@ PYTHONPATH=. pytest tests/ -v
 ```
 
 169 tests, ~8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and on every PR targeting `main`:
+
+- **`test`** — installs `requirements.txt`, regenerates protobuf stubs with the pinned toolchain (`scripts/gen_protos.sh`), runs the full `pytest` suite.
+- **`lint`** — runs `ruff check .` (`ruff.toml` pins the rule set to `E4`/`E7`/`E9`/`F` and excludes generated protobuf files).
+- **`docker-build-push`** — depends on both `test` and `lint` passing. Builds `ops/Dockerfile` on every push/PR (catches a broken Dockerfile before merge); on pushes to `main` only, also publishes `ghcr.io/angelali03/raft-node:latest` and `:<git-sha>`.
+
+### Enabling required status checks (one-time, manual)
+
+GitHub branch protection isn't configurable from a workflow file — this is a one-time repo setting:
+
+1. GitHub repo → Settings → Branches → Add branch protection rule
+2. Branch name pattern: `main`
+3. Enable "Require status checks to pass before merging"
+4. Select `test` and `lint` as required checks
+5. Save
 
 ## Running the Cluster
 
@@ -263,6 +282,9 @@ Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # test, lint, docker-build-push (GHCR, main only)
 ├── proto/                     # Protobuf service definitions
 │   ├── raft.proto             # Raft internal RPCs
 │   └── client.proto           # Client-facing RPCs
@@ -287,10 +309,11 @@ Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -
 │   ├── benchmark.py            # Load benchmark (import + mixed-workload race fixed, live verification partial)
 │   ├── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
 │   └── dashboard_demo.py       # Narrated live demo of the monitoring stack (failover, quorum loss, flapping)
-├── tests/                      # 16 files, ~4,300 lines, 169 tests, all passing
+├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
 │   ├── docker-compose.monitoring.yml  # Prometheus + Grafana, joins raft-network
 │   └── monitoring/             # Prometheus scrape config, Grafana datasource/dashboard/alert provisioning
+├── ruff.toml                   # Lint rule set (E4/E7/E9/F), excludes generated protobuf files
 └── README.md
 ```
 
