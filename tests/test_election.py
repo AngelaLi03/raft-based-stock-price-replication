@@ -3,7 +3,6 @@ Tests for Raft election logic.
 """
 
 import pytest
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from raft.types import PeerInfo, RaftState

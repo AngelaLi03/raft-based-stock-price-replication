@@ -5,7 +5,7 @@ Prometheus metrics integration for Raft cluster observability.
 import time
 import logging
 from typing import Dict, Any, Optional
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from prometheus_client.core import CollectorRegistry
 
 logger = logging.getLogger(__name__)

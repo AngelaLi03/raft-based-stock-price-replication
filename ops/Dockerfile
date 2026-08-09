@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Keep this block in sync with scripts/gen_protos.sh - duplicated here
+# rather than shared, since this runs inside the build with no access
+# to run a host-side script at this stage.
 # Generate protobuf files
 RUN python -m grpc_tools.protoc --proto_path=proto --python_out=. --grpc_python_out=. proto/raft.proto && \
     python -m grpc_tools.protoc --proto_path=proto --python_out=. --grpc_python_out=. proto/client.proto && \

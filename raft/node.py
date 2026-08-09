@@ -752,7 +752,6 @@ class RaftNode:
                 # Record commit metrics
                 try:
                     from raft.prometheus_metrics import record_commit
-                    import time
                     # Simple timing for commit operation
                     commit_duration = 1.0  # Approximate
                     record_commit(self.commit_index - old_commit_index, commit_duration)

@@ -6,12 +6,10 @@ import json
 import logging
 import time
 import os
-import tempfile
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import asyncio
 
-from client.proto import client_pb2
 
 logger = logging.getLogger(__name__)
 

@@ -31,8 +31,10 @@ mv client_pb2.py client/proto/
 mv client_pb2_grpc.py client/proto/
 
 # Fix import statements in generated files
-sed -i '' 's/import raft_pb2 as raft__pb2/from . import raft_pb2 as raft__pb2/g' raft/proto/raft_pb2_grpc.py
-sed -i '' 's/import client_pb2 as client__pb2/from . import client_pb2 as client__pb2/g' client/proto/client_pb2_grpc.py
+# (avoid `sed -i ''`: that's BSD/macOS-only syntax and breaks on GNU sed/Linux CI runners,
+# where '' is parsed as the script and the real script as a filename)
+sed 's/import raft_pb2 as raft__pb2/from . import raft_pb2 as raft__pb2/g' raft/proto/raft_pb2_grpc.py > raft/proto/raft_pb2_grpc.py.tmp && mv raft/proto/raft_pb2_grpc.py.tmp raft/proto/raft_pb2_grpc.py
+sed 's/import client_pb2 as client__pb2/from . import client_pb2 as client__pb2/g' client/proto/client_pb2_grpc.py > client/proto/client_pb2_grpc.py.tmp && mv client/proto/client_pb2_grpc.py.tmp client/proto/client_pb2_grpc.py
 
 # Create __init__.py files
 touch raft/proto/__init__.py
