@@ -973,14 +973,16 @@ class RaftNode:
 
         while self.state == RaftState.LEADER:
             try:
-                # Send heartbeats to all peers
-                heartbeat_tasks = []
+                # Fire heartbeats to all peers without waiting for them to
+                # finish - awaiting them here (as this used to) lets one
+                # slow/down peer's RPC latency delay the next round of
+                # heartbeats to every OTHER peer too, stretching their
+                # effective heartbeat interval toward ELECTION_TIMEOUT_MIN
+                # and risking a spurious election. Each task updates its
+                # own peer's next_index/match_index on completion
+                # regardless of whether the loop is still awaiting it.
                 for peer in self.peers:
-                    task = asyncio.create_task(self._send_heartbeat_to_peer(peer))
-                    heartbeat_tasks.append(task)
-
-                if heartbeat_tasks:
-                    await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
+                    asyncio.create_task(self._send_heartbeat_to_peer(peer))
 
                 # Wait for next heartbeat
                 await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)

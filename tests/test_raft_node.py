@@ -300,3 +300,40 @@ async def test_request_vote_from_peer_times_out_on_unresponsive_peer(raft_node):
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_does_not_delay_healthy_peers_for_a_slow_one(raft_node):
+    """A slow/unresponsive peer must not stretch the heartbeat cadence to
+    every OTHER peer. Live-observed: _heartbeat_loop used to await
+    asyncio.gather() over every peer's heartbeat before sleeping, so one
+    down peer's RPC latency (up to RPC_TIMEOUT_SECONDS) delayed the next
+    round of heartbeats to healthy peers too - stretching their effective
+    heartbeat interval close to ELECTION_TIMEOUT_MIN and triggering
+    unnecessary elections cluster-wide."""
+    raft_node.state = RaftState.LEADER
+    call_counts = {"node2": 0, "node3": 0}
+
+    async def fake_send_heartbeat(peer):
+        call_counts[peer.node_id] += 1
+        if peer.node_id == "node2":
+            await asyncio.sleep(2.0)  # simulates a down/slow peer
+
+    raft_node._send_heartbeat_to_peer = fake_send_heartbeat
+
+    loop_task = asyncio.create_task(raft_node._heartbeat_loop())
+    try:
+        await asyncio.sleep(0.4)
+    finally:
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    # At 75ms/cycle, the healthy peer should have been contacted several
+    # times in 400ms if the loop's cadence isn't gated on the slow peer's
+    # still-pending 2s call. The old, blocking implementation would only
+    # ever have reached call_counts["node3"] == 1 in this window.
+    assert call_counts["node3"] >= 3
+    assert call_counts["node2"] >= 1
