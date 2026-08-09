@@ -7,7 +7,7 @@ import logging
 import os
 from typing import List, Optional, Dict, Any
 
-from .types import RaftState, PeerInfo, LogEntry
+from .types import RaftState, PeerInfo, LogEntry, RPC_TIMEOUT_SECONDS
 from .storage import RaftStorage
 from .election import ElectionManager
 from kv.state_machine import KVStateMachine, TickerPrice, serialize_put_command, serialize_batch_put_command
@@ -214,7 +214,7 @@ class RaftNode:
             )
             
             # Send request
-            response = await stub.RequestVote(request)
+            response = await stub.RequestVote(request, timeout=RPC_TIMEOUT_SECONDS)
             
             # Close channel
             await channel.close()
@@ -266,7 +266,7 @@ class RaftNode:
             )
             
             # Send request
-            response = await stub.AppendEntries(request)
+            response = await stub.AppendEntries(request, timeout=RPC_TIMEOUT_SECONDS)
             
             # Close channel
             await channel.close()
@@ -304,7 +304,7 @@ class RaftNode:
                 data=json.dumps(snapshot["kv_state"]).encode('utf-8')
             )
 
-            response = await stub.InstallSnapshot(request)
+            response = await stub.InstallSnapshot(request, timeout=RPC_TIMEOUT_SECONDS)
             await channel.close()
 
             if not response:
@@ -978,10 +978,10 @@ class RaftNode:
                 for peer in self.peers:
                     task = asyncio.create_task(self._send_heartbeat_to_peer(peer))
                     heartbeat_tasks.append(task)
-                
+
                 if heartbeat_tasks:
                     await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
-                
+
                 # Wait for next heartbeat
                 await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
                 

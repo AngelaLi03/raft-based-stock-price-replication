@@ -65,6 +65,14 @@ ELECTION_TIMEOUT_MIN = 150  # milliseconds
 ELECTION_TIMEOUT_MAX = 300  # milliseconds
 HEARTBEAT_INTERVAL = 75     # milliseconds
 
+# Deadline for a single outbound peer RPC (RequestVote/AppendEntries/
+# InstallSnapshot). Without this, a peer that accepts the TCP connection but
+# never responds (e.g. mid-restart) hangs the call forever - and since
+# _start_election/_heartbeat_loop gather() every peer's RPC and wait for all
+# of them, one stuck peer freezes that node's entire election or heartbeat
+# loop, not just replication to that one peer.
+RPC_TIMEOUT_SECONDS = 2.0
+
 # Batching configuration
 DEFAULT_BATCH_SIZE = 10     # entries per batch
 DEFAULT_FLUSH_INTERVAL = 50 # milliseconds

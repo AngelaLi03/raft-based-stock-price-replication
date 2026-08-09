@@ -16,6 +16,14 @@ from client.proto import client_pb2, client_pb2_grpc
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# Deadline for a single RPC. Without this, a node that accepts the TCP
+# connection but never responds (mid-restart, or struggling under an
+# election storm) hangs the caller forever - this is what made
+# chaos_test.py's _get_leader() (which loops over every node with no
+# per-call timeout) hang for 25+ minutes on a live cluster. Same fix as
+# raft/node.py's RPC_TIMEOUT_SECONDS, applied on the client side.
+RPC_TIMEOUT_SECONDS = 2.0
+
 
 class RaftClient:
     """Client for interacting with Raft cluster."""
@@ -46,7 +54,7 @@ class RaftClient:
                 stub = client_pb2_grpc.ClientServiceStub(channel)
                 
                 request = client_pb2.GetClusterInfoRequest()
-                response = await stub.GetClusterInfo(request)
+                response = await stub.GetClusterInfo(request, timeout=RPC_TIMEOUT_SECONDS)
                 
                 return {
                     "leader_id": response.leader_id,
@@ -77,7 +85,7 @@ class RaftClient:
                 )
                 
                 request = client_pb2.PutPriceRequest(ticker_price=ticker_price)
-                response = await stub.PutPrice(request)
+                response = await stub.PutPrice(request, timeout=RPC_TIMEOUT_SECONDS)
                 
                 return {
                     "ok": response.ok,
@@ -108,7 +116,7 @@ class RaftClient:
                 ]
 
                 request = client_pb2.BatchPutPriceRequest(ticker_prices=ticker_prices)
-                response = await stub.BatchPutPrice(request)
+                response = await stub.BatchPutPrice(request, timeout=RPC_TIMEOUT_SECONDS)
 
                 return {
                     "ok": response.ok,
@@ -127,7 +135,7 @@ class RaftClient:
                 stub = client_pb2_grpc.ClientServiceStub(channel)
                 
                 request = client_pb2.GetPriceRequest(symbol=symbol)
-                response = await stub.GetPrice(request)
+                response = await stub.GetPrice(request, timeout=RPC_TIMEOUT_SECONDS)
                 
                 if response.found:
                     return {
@@ -153,7 +161,7 @@ class RaftClient:
                 stub = client_pb2_grpc.ClientServiceStub(channel)
                 
                 request = client_pb2.DumpStateRequest()
-                response = await stub.DumpState(request)
+                response = await stub.DumpState(request, timeout=RPC_TIMEOUT_SECONDS)
                 
                 if response.ok:
                     kv_store = []

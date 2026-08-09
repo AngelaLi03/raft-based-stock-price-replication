@@ -273,3 +273,30 @@ async def test_metrics_tick_task_starts_on_start_and_cancels_on_stop(raft_node):
     # distinguishes correct cancellation handling from broken.
     assert raft_node.metrics_tick_task.done()
     assert not raft_node.metrics_tick_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_request_vote_from_peer_times_out_on_unresponsive_peer(raft_node):
+    """A peer that accepts the TCP connection but never speaks back (e.g.
+    mid-restart, port open but gRPC server not yet serving) must not hang
+    the caller forever. Live-observed: _start_election batches every peer's
+    RequestVote into one asyncio.gather() and waits for all of them, so one
+    peer stuck like this freezes the candidate's election indefinitely -
+    it never logs "Election results" and never becomes follower or leader."""
+    async def _accept_and_never_respond(reader, writer):
+        await asyncio.sleep(3600)
+
+    server = await asyncio.start_server(_accept_and_never_respond, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    dead_peer = PeerInfo("dead_peer", "127.0.0.1", port, port, port)
+    raft_node.raft_server = True  # bypass the "server not started" guard
+
+    try:
+        result = await asyncio.wait_for(
+            raft_node._request_vote_from_peer("dead_peer", dead_peer, term=1, last_log_index=0, last_log_term=0),
+            timeout=5.0
+        )
+        assert result is None
+    finally:
+        server.close()
+        await server.wait_closed()
