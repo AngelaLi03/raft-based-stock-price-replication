@@ -655,6 +655,17 @@ These metrics help identify bottlenecks, detect leader churn, and understand sys
 
 The interesting part is a bug I found live-testing the alerting itself, not the Raft code: my first version of the 'no leader' PromQL condition used `count(raft_node_role == 2)`, which returns *no data* — not zero — when nothing matches. Grafana treats 'no data' as a separate state from 'the condition is false,' so that query would silently fail to fire on exactly the case it's meant to catch. I fixed it with `sum(raft_node_role == bool 2)`, which keeps every series present with a 0-or-1 value instead of filtering series out, so the sum is always a real number. It's a good example of why I don't trust a dashboard or an alert just because it's provisioned without an error — I stop live nodes and actually watch the alert transition firing-to-resolved before I trust it, the same discipline I use for testing the consensus algorithm itself."
 
+### "What's a bug you found that unit tests structurally couldn't catch?"
+
+**Answer**:
+"Three, actually, all found by running `chaos_test.py` — my fault-injection script that stops/starts real Docker containers — against the live 15-node cluster, and all three share a root cause: the code assumed a failing peer always shows up as an exception. It doesn't.
+
+First: none of my gRPC calls had a `timeout=`. A container mid-restart accepts the TCP connection but doesn't respond yet — that's not an error, it's just silence, and `await stub.RequestVote(request)` with no deadline hangs forever. Since my election and heartbeat loops each `asyncio.gather()` every peer's RPC and wait for all of them, one stuck peer froze the whole loop — I found a candidate stuck for 6 minutes and a leader whose heartbeats had gone completely silent. Fixed with a 2-second timeout on every outbound RPC, client and server side.
+
+Second, and this one only became *visible* once the first fix landed: my heartbeat loop's actual cadence was `slowest peer's response time + 75ms`, not a flat 75ms, because it awaited every peer before sleeping. With one node down for an extended period, that was enough to occasionally push heartbeats past the 150ms election timeout — I watched the cluster's term climb by over 100 in a few minutes, a genuine self-inflicted election storm. Fixed by firing heartbeats without awaiting them before the sleep.
+
+Third, and the most serious: a write got acked `ok=True` and then vanished from every node, including the leader that wrote it. Root cause — my commit-index update silently no-ops once you're no longer leader, but the code resolved the client's confirmation future from the replication-ACK count alone, without checking that. If leadership flips in that tiny window, the entry is majority-replicated but never actually committed, and the next leader can freely overwrite it. None of these are reproducible by mocking the network — a mock either returns or raises, it can't 'accept the connection and then say nothing.' That's exactly why I keep chaos testing in the pipeline even though the unit suite is fast and green."
+
 ### "How does batching work?"
 
 **Answer**:
@@ -692,7 +703,7 @@ This system demonstrates:
 - **Deep understanding** of distributed systems concepts
 - **Production-ready** implementation with durability, recovery, and observability
 - **Performance optimization** through batching and concurrent replication
-- **Comprehensive testing** with 71 tests covering various scenarios
+- **Comprehensive testing** with 169 tests covering various scenarios
 - **Real-world considerations** like metrics, logging, and chaos testing
 
 **Key Strengths for Interview**:
