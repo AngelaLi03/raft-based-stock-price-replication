@@ -2,6 +2,7 @@
 Raft types, enums, and constants.
 """
 
+import re
 from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, Any
@@ -87,3 +88,20 @@ DEFAULT_CLIENT_PORT = 50061
 
 # Logging
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+
+def metrics_port_for_node_id(node_id: str, base: int = 8000) -> int:
+    """Derive this node's metrics port from its ID.
+
+    Handles both naming schemes this project uses: Docker Compose's
+    "node1"/"node15" and Kubernetes StatefulSet's "raft-node-0". Takes the
+    trailing integer in the ID, so "node15" -> 15 and "raft-node-0" -> 0.
+
+    Never raises: an ID with no trailing digits falls back to offset 1.
+    The previous implementation, `int(node_id.replace('node', ''))`, raised
+    ValueError on StatefulSet-style IDs - which crashed RaftNode outright
+    and silently disabled the metrics server (and with it the readiness
+    probe) in GrpcServer.
+    """
+    match = re.search(r'(\d+)$', node_id)
+    return base + (int(match.group(1)) if match else 1)
