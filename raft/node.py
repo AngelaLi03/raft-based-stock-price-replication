@@ -487,7 +487,24 @@ class RaftNode:
             if success:
                 # Update commit index and apply
                 await self._update_commit_index()
-                logger.info(f"Successfully replicated batch of {len(entries_to_flush)} entries")
+                if self.state != RaftState.LEADER:
+                    # _update_commit_index() silently no-ops once we're no
+                    # longer leader, so a step-down between
+                    # _replicate_to_peers() returning and here would
+                    # otherwise report ok=True for a batch that was never
+                    # actually committed - it only exists as
+                    # majority-replicated-but-uncommitted raw log data that
+                    # the next leader can freely overwrite. Live-observed:
+                    # a leader reported ok=True for writes that then
+                    # vanished from every node, including itself.
+                    logger.warning(
+                        f"Batch reached majority but leadership was lost before "
+                        f"commit - reporting failure for {len(entries_to_flush)} entries"
+                    )
+                    self.storage.truncate_log_from(entries_to_flush[0].index)
+                    success = False
+                else:
+                    logger.info(f"Successfully replicated batch of {len(entries_to_flush)} entries")
             else:
                 # Replication failed - remove entries from log, preserving everything
                 # before this batch (entries_to_flush are contiguous, appended together).

@@ -160,10 +160,42 @@ async def test_put_price_as_leader(raft_node):
     raft_node.storage.append_entries = MagicMock()
     
     result = await raft_node.put_price("AAPL", 150.0, 1234567890)
-    
+
     assert result["ok"] is True
     assert result["leader_hint"] == "node1"
     assert result["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_put_price_fails_if_leadership_lost_before_commit(raft_node):
+    """A batch that reaches majority replication ACKs but where this node
+    stepped down before actually committing must not report ok=True.
+    _update_commit_index() silently no-ops once state != LEADER, so
+    without this check the client would be told its write succeeded when
+    the entry only exists as majority-replicated-but-uncommitted raw log
+    data that the next leader can freely overwrite. Live-observed via
+    chaos_test.py: a leader reported ok=True for writes that later vanished
+    from every node in the cluster, including itself."""
+    raft_node.state = RaftState.LEADER
+    raft_node.election_manager.current_term = 1
+    raft_node.batch_size = 1
+
+    for peer in raft_node.peers:
+        raft_node.next_index[peer.node_id] = 1
+        raft_node.match_index[peer.node_id] = 0
+
+    async def replicate_then_step_down(entries):
+        raft_node.state = RaftState.FOLLOWER  # leadership lost mid-flush
+        return True  # majority still ACKed before the step-down
+
+    raft_node._replicate_to_peers = replicate_then_step_down
+    raft_node.storage.get_last_log_index = MagicMock(return_value=0)
+    raft_node.storage.append_entries = MagicMock()
+    raft_node.storage.truncate_log_from = MagicMock()
+
+    result = await raft_node.put_price("AAPL", 150.0, 1234567890)
+
+    assert result["ok"] is False
 
 
 @pytest.mark.asyncio
