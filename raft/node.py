@@ -7,7 +7,7 @@ import logging
 import os
 from typing import List, Optional, Dict, Any
 
-from .types import RaftState, PeerInfo, LogEntry
+from .types import RaftState, PeerInfo, LogEntry, RPC_TIMEOUT_SECONDS
 from .storage import RaftStorage
 from .election import ElectionManager
 from kv.state_machine import KVStateMachine, TickerPrice, serialize_put_command, serialize_batch_put_command
@@ -74,7 +74,8 @@ class RaftNode:
             request_vote_callback=self._request_vote_from_peer,
             become_leader_callback=self._on_become_leader,
             become_follower_callback=self._on_become_follower,
-            get_last_log_info_callback=self._get_last_log_info
+            get_last_log_info_callback=self._get_last_log_info,
+            become_candidate_callback=self._on_become_candidate
         )
         
         # Current state
@@ -90,6 +91,7 @@ class RaftNode:
         self.pending_entries: List[LogEntry] = []
         self._pending_futures: Dict[int, asyncio.Future] = {}  # log index -> future resolved on flush
         self.batch_flush_task: Optional[asyncio.Task] = None
+        self.metrics_tick_task: Optional[asyncio.Task] = None
         self.batch_lock = asyncio.Lock()
         
         # gRPC server references (set by server)
@@ -155,7 +157,9 @@ class RaftNode:
         
         # Start as follower with election timeout
         self.election_manager.start_election_timeout()
-        
+
+        self.metrics_tick_task = asyncio.create_task(self._metrics_tick_loop())
+
         logger.info(f"Raft node {self.node_id} started as {self.state.value} (recovery complete)")
     
     async def stop(self) -> None:
@@ -165,7 +169,14 @@ class RaftNode:
         # Stop election timeout and heartbeats
         self.election_manager.stop_election_timeout()
         self.election_manager.stop_heartbeat()
-        
+
+        if self.metrics_tick_task:
+            self.metrics_tick_task.cancel()
+            try:
+                await self.metrics_tick_task
+            except asyncio.CancelledError:
+                pass
+
         # Stop KV state machine
         await self.kv_state_machine.stop()
         
@@ -203,7 +214,7 @@ class RaftNode:
             )
             
             # Send request
-            response = await stub.RequestVote(request)
+            response = await stub.RequestVote(request, timeout=RPC_TIMEOUT_SECONDS)
             
             # Close channel
             await channel.close()
@@ -255,7 +266,7 @@ class RaftNode:
             )
             
             # Send request
-            response = await stub.AppendEntries(request)
+            response = await stub.AppendEntries(request, timeout=RPC_TIMEOUT_SECONDS)
             
             # Close channel
             await channel.close()
@@ -293,7 +304,7 @@ class RaftNode:
                 data=json.dumps(snapshot["kv_state"]).encode('utf-8')
             )
 
-            response = await stub.InstallSnapshot(request)
+            response = await stub.InstallSnapshot(request, timeout=RPC_TIMEOUT_SECONDS)
             await channel.close()
 
             if not response:
@@ -312,6 +323,11 @@ class RaftNode:
 
         except Exception as e:
             logger.warning(f"Failed to install snapshot on {peer.node_id}: {e}")
+
+    async def _on_become_candidate(self) -> None:
+        """Called when this node becomes candidate."""
+        self.state = RaftState.CANDIDATE
+        self._record_state_metrics()
 
     async def _on_become_leader(self) -> None:
         """Called when this node becomes leader."""
@@ -349,6 +365,7 @@ class RaftNode:
             )
         
         logger.info(f"Node {self.node_id} became leader for term {self.election_manager.current_term}")
+        self._record_state_metrics()
     
     async def _on_become_follower(self) -> None:
         """Called when this node becomes follower."""
@@ -375,6 +392,7 @@ class RaftNode:
             self._pending_futures.clear()
 
         logger.info(f"Node {self.node_id} became follower")
+        self._record_state_metrics()
     
     # Batching methods
     
@@ -469,7 +487,24 @@ class RaftNode:
             if success:
                 # Update commit index and apply
                 await self._update_commit_index()
-                logger.info(f"Successfully replicated batch of {len(entries_to_flush)} entries")
+                if self.state != RaftState.LEADER:
+                    # _update_commit_index() silently no-ops once we're no
+                    # longer leader, so a step-down between
+                    # _replicate_to_peers() returning and here would
+                    # otherwise report ok=True for a batch that was never
+                    # actually committed - it only exists as
+                    # majority-replicated-but-uncommitted raw log data that
+                    # the next leader can freely overwrite. Live-observed:
+                    # a leader reported ok=True for writes that then
+                    # vanished from every node, including itself.
+                    logger.warning(
+                        f"Batch reached majority but leadership was lost before "
+                        f"commit - reporting failure for {len(entries_to_flush)} entries"
+                    )
+                    self.storage.truncate_log_from(entries_to_flush[0].index)
+                    success = False
+                else:
+                    logger.info(f"Successfully replicated batch of {len(entries_to_flush)} entries")
             else:
                 # Replication failed - remove entries from log, preserving everything
                 # before this batch (entries_to_flush are contiguous, appended together).
@@ -921,34 +956,50 @@ class RaftNode:
         
         return entry.term == prev_log_term
     
+    def _record_state_metrics(self) -> None:
+        """Refresh this node's role and state gauges from current in-memory state."""
+        try:
+            from raft.prometheus_metrics import update_node_state, update_node_role
+            update_node_state(
+                self.election_manager.current_term,
+                self.commit_index,
+                self.last_applied,
+                self.storage.get_last_log_index()
+            )
+            update_node_role(self.state.value)
+        except ImportError:
+            pass
+
+    async def _metrics_tick_loop(self) -> None:
+        """Periodically refresh state metrics for this node regardless of
+        role - unlike the heartbeat loop, this runs on followers too."""
+        while True:
+            try:
+                self._record_state_metrics()
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in metrics tick loop: {e}")
+                await asyncio.sleep(2.0)
+
     async def _heartbeat_loop(self) -> None:
         """Send heartbeats to all followers."""
         from .types import HEARTBEAT_INTERVAL
-        
+
         while self.state == RaftState.LEADER:
             try:
-                # Update node state metrics
-                try:
-                    from raft.prometheus_metrics import update_node_state
-                    log_length = self.storage.get_last_log_index()
-                    update_node_state(
-                        self.election_manager.current_term,
-                        self.commit_index,
-                        self.last_applied,
-                        log_length
-                    )
-                except ImportError:
-                    pass
-                
-                # Send heartbeats to all peers
-                heartbeat_tasks = []
+                # Fire heartbeats to all peers without waiting for them to
+                # finish - awaiting them here (as this used to) lets one
+                # slow/down peer's RPC latency delay the next round of
+                # heartbeats to every OTHER peer too, stretching their
+                # effective heartbeat interval toward ELECTION_TIMEOUT_MIN
+                # and risking a spurious election. Each task updates its
+                # own peer's next_index/match_index on completion
+                # regardless of whether the loop is still awaiting it.
                 for peer in self.peers:
-                    task = asyncio.create_task(self._send_heartbeat_to_peer(peer))
-                    heartbeat_tasks.append(task)
-                
-                if heartbeat_tasks:
-                    await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
-                
+                    asyncio.create_task(self._send_heartbeat_to_peer(peer))
+
                 # Wait for next heartbeat
                 await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
                 

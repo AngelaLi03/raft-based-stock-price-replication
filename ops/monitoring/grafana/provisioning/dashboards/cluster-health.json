@@ -1,0 +1,101 @@
+{
+  "title": "Cluster Health",
+  "uid": "raft-cluster-health",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current Role per Node",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "raft_node_role", "legendFormat": "{{node_id}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "follower", "color": "blue" },
+                "1": { "text": "candidate", "color": "yellow" },
+                "2": { "text": "leader", "color": "green" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Current Term per Node",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "raft_current_term", "legendFormat": "{{node_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Leader Changes Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "increase(raft_leader_changes_total[$__interval])", "legendFormat": "{{node_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Election Duration (ms, avg)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(raft_election_duration_ms_sum[$__interval]) / rate(raft_election_duration_ms_count[$__interval])",
+          "legendFormat": "{{node_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Per-Follower Commit Lag",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "scalar(max(raft_commit_index)) - raft_commit_index", "legendFormat": "{{node_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Quorum Health (reachable nodes, need 8/15)",
+      "description": "The '8/15' in the title and the threshold value below are hardcoded for a 15-node cluster. If the cluster is ever regenerated at a different --nodes count via scripts/gen_docker_compose.py, update both by hand.",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "count(up{job=\"raft-nodes\"} == 1)", "legendFormat": "reachable nodes", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 8 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

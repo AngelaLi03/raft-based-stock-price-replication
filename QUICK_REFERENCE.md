@@ -91,6 +91,13 @@ Client → gRPC → ClientService → RaftNode.get_price()
 - **Key gotcha**: `count(x == 2)` returns *no data* (not 0) on zero matches — used `sum(x == bool 2)` instead so the no-leader alert can actually fire on the case it exists for
 - **`scripts/dashboard_demo.py`**: narrated live demo — failover, quorum loss, flapping — watchable on the dashboard in real time
 
+## 🌪️ Chaos-Testing Bugs Found (Live 15-Node Cluster)
+
+- **No RPC had a `timeout=`** → a peer accepting-but-not-responding (mid-restart) hung the caller forever → since election/heartbeat loops `gather()` every peer's RPC before proceeding, one stuck peer froze the *entire* loop, not just that peer. A candidate stuck 6+ minutes; a leader's heartbeat loop went silent mid-term. Fixed: `RPC_TIMEOUT_SECONDS = 2.0` on every outbound RPC, client and server.
+- **Heartbeat loop cadence wasn't flat 75ms** → it awaited every peer via `gather()` before sleeping, so one down peer's failure latency delayed heartbeats to *every* peer. With `ELECTION_TIMEOUT_MIN` only 2× the heartbeat interval, this triggered a real election storm (term +100 in minutes) with one node down. Fixed: fire-and-forget each peer's heartbeat instead of awaiting before sleep.
+- **A write could ack `ok=True` and then vanish** → commit-index update silently no-ops once no longer leader, but the confirmation future was resolved from the replication-ACK count alone, not from whether commit actually happened. Stepping down in that window let an entry look "successful" while never being committed anywhere — the next leader could freely overwrite it. Fixed: check `state == LEADER` after the commit-index update before reporting success.
+- **Key pattern**: all three assumed a failing peer always raises an exception. A mock can't reproduce "accepts the connection, then says nothing" — only a real container mid-restart can, which is exactly why these needed the live cluster, not more unit tests, to find.
+
 ## 🎤 Common Interview Questions
 
 ### "What was the biggest challenge?"
@@ -107,6 +114,9 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ### "How do you monitor it?"
 **Answer**: "Grafana + Prometheus, provisioned as code. Found a real bug testing the alerting itself: `count(role==2)` returns no data (not 0) when no leader exists, which Grafana treats as a separate non-firing state — fixed with `sum(role == bool 2)` so it always returns a real number. I don't trust an alert until I've actually stopped a node and watched it fire and resolve."
+
+### "What's a bug unit tests couldn't have caught?"
+**Answer**: "None of my gRPC calls had a timeout, so a container mid-restart — TCP connected, not yet responding — hung the caller forever instead of erroring, and since my election/heartbeat loops wait on every peer via `gather()`, one stuck peer froze the whole loop. Fixed with a 2-second RPC deadline everywhere. A mock can't reproduce that failure mode — it either returns or raises — so this only showed up running `chaos_test.py` against real Docker containers."
 
 ## 🔑 Key Design Decisions
 
@@ -129,7 +139,7 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ## 🧪 Testing Coverage
 
-- **71 tests** covering:
+- **169 tests** covering:
   - Leader election scenarios
   - Log replication
   - Crash recovery

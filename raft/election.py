@@ -5,6 +5,7 @@ Raft election logic and timeout handling.
 import asyncio
 import random
 import logging
+import time
 from typing import Dict, List, Optional, Callable, Tuple
 
 from .types import RaftState, PeerInfo, ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL
@@ -19,7 +20,8 @@ class ElectionManager:
                  request_vote_callback: Callable,
                  become_leader_callback: Callable,
                  become_follower_callback: Callable,
-                 get_last_log_info_callback: Optional[Callable[[], Tuple[int, int]]] = None):
+                 get_last_log_info_callback: Optional[Callable[[], Tuple[int, int]]] = None,
+                 become_candidate_callback: Optional[Callable] = None):
         """
         Initialize election manager.
 
@@ -33,6 +35,9 @@ class ElectionManager:
                 for this node's own log. Used both to advertise this node's log state
                 when requesting votes, and to evaluate the log up-to-date check when
                 granting votes. Defaults to an empty log if not provided.
+            become_candidate_callback: Function to call when becoming candidate
+                (optional - defaults to None so existing callers don't need to
+                supply one).
         """
         self.node_id = node_id
         self.peers = {peer.node_id: peer for peer in peers}
@@ -40,6 +45,7 @@ class ElectionManager:
         self.become_leader_callback = become_leader_callback
         self.become_follower_callback = become_follower_callback
         self.get_last_log_info_callback = get_last_log_info_callback or (lambda: (0, 0))
+        self.become_candidate_callback = become_candidate_callback
         
         # Election state
         self.election_timeout_task: Optional[asyncio.Task] = None
@@ -102,37 +108,49 @@ class ElectionManager:
     
     async def _start_election(self) -> None:
         """Start a new election."""
+        start_time = time.time()
+
         # Increment term and become candidate
         self.current_term += 1
         self.voted_for = self.node_id
         self.state = RaftState.CANDIDATE
+        if self.become_candidate_callback:
+            await self.become_candidate_callback()
         self.votes_received = {self.node_id: True}  # Vote for self
-        
+
         logger.info(f"Starting election for term {self.current_term}")
-        
+
         # Request votes from all peers
         vote_tasks = []
         for peer_id, peer in self.peers.items():
             task = asyncio.create_task(self._request_vote(peer_id, peer))
             vote_tasks.append(task)
-        
+
         # Wait for all vote requests to complete
         if vote_tasks:
             await asyncio.gather(*vote_tasks, return_exceptions=True)
-        
+
         # Check if we won the election
         total_votes = len(self.votes_received)
         votes_for_me = sum(1 for voted in self.votes_received.values() if voted)
         majority = (len(self.peers) + 1) // 2 + 1  # +1 for self
-        
+
         logger.info(f"Election results: {votes_for_me}/{total_votes} votes, need {majority}")
-        
+
         if votes_for_me >= majority:
             logger.info("Won election - becoming leader")
             await self._become_leader()
         else:
             logger.info("Lost election - becoming follower")
             await self._become_follower()
+
+        # Record how long the whole election took, regardless of outcome.
+        duration_ms = (time.time() - start_time) * 1000
+        try:
+            from raft.prometheus_metrics import record_election
+            record_election(duration_ms)
+        except ImportError:
+            pass
     
     async def _request_vote(self, peer_id: str, peer: PeerInfo) -> None:
         """Request vote from a peer."""
