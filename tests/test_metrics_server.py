@@ -45,3 +45,59 @@ async def test_handle_health():
 
     assert response.status == 200
     assert response.body == b"OK"
+
+
+@pytest.mark.asyncio
+async def test_handle_ready_returns_503_without_a_node_reference():
+    """No node wired in means we can't assert readiness - fail closed."""
+    server = MetricsServer(port=0)
+
+    response = await server.handle_ready(MagicMock())
+
+    assert response.status == 503
+
+
+@pytest.mark.asyncio
+async def test_handle_ready_returns_503_while_still_a_candidate():
+    """Mid-election, the node can't usefully serve traffic yet."""
+    from raft.types import RaftState
+
+    node = MagicMock()
+    node.state = RaftState.CANDIDATE
+    server = MetricsServer(port=0, raft_node=node)
+
+    response = await server.handle_ready(MagicMock())
+
+    assert response.status == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ["FOLLOWER", "LEADER"])
+async def test_handle_ready_returns_200_once_role_is_settled(state_name):
+    """A settled follower serves reads; a leader serves writes. Both ready."""
+    from raft.types import RaftState
+
+    node = MagicMock()
+    node.state = getattr(RaftState, state_name)
+    server = MetricsServer(port=0, raft_node=node)
+
+    response = await server.handle_ready(MagicMock())
+
+    assert response.status == 200
+    assert state_name.lower().encode() in response.body.lower()
+
+
+@pytest.mark.asyncio
+async def test_health_stays_unconditional_ok():
+    """Liveness must NOT become role-aware - a candidate is alive, just not
+    ready, and restarting it mid-election would be actively harmful."""
+    from raft.types import RaftState
+
+    node = MagicMock()
+    node.state = RaftState.CANDIDATE
+    server = MetricsServer(port=0, raft_node=node)
+
+    response = await server.handle_health(MagicMock())
+
+    assert response.status == 200
+    assert response.body == b"OK"

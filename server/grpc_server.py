@@ -337,7 +337,7 @@ class GrpcServer:
             from server.metrics_server import start_metrics_server
             from raft.types import metrics_port_for_node_id
             metrics_port = metrics_port_for_node_id(self.raft_node.node_id)
-            await start_metrics_server(metrics_port)
+            await start_metrics_server(metrics_port, raft_node=self.raft_node)
             logger.info(f"Metrics server started on port {metrics_port}")
         except Exception as e:
             logger.warning(f"Failed to start metrics server: {e}")

@@ -12,11 +12,15 @@ logger = logging.getLogger(__name__)
 class MetricsServer:
     """HTTP server for serving Prometheus metrics."""
     
-    def __init__(self, port: int = 8000):
+    def __init__(self, port: int = 8000, raft_node=None):
         self.port = port
+        # Optional so the Compose path and unit tests can construct this
+        # without a node; /ready fails closed (503) when it's absent.
+        self.raft_node = raft_node
         self.app = web.Application()
         self.app.router.add_get('/metrics', self.handle_metrics)
         self.app.router.add_get('/health', self.handle_health)
+        self.app.router.add_get('/ready', self.handle_ready)
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
     
@@ -80,15 +84,45 @@ class MetricsServer:
             content_type='text/plain'
         )
 
+    async def handle_ready(self, request: web_request.Request) -> web_response.Response:
+        """Handle /ready endpoint - the Kubernetes readiness probe.
+
+        Distinct from /health (liveness) on purpose. Liveness answers "is
+        this process alive"; readiness answers "should this pod receive
+        traffic". A node that hasn't finished its first election has no
+        useful answer for anyone: it doesn't know who the leader is, so it
+        can neither serve writes nor vouch for its reads. Once it settles
+        into a role - follower or leader - it's ready.
+
+        Deliberately NOT checking commit_index freshness: that would need
+        the cluster's true commit_index to compare against, which is a
+        meaningfully harder problem and isn't what readiness is for here.
+        """
+        from raft.types import RaftState
+
+        if self.raft_node is None:
+            return web.Response(status=503, text="not ready: no node reference")
+
+        state = getattr(self.raft_node, "state", None)
+        if state in (RaftState.FOLLOWER, RaftState.LEADER):
+            return web.Response(status=200, text=f"ready: {state.value}")
+
+        state_name = state.value if isinstance(state, RaftState) else "unknown"
+        return web.Response(status=503, text=f"not ready: {state_name}")
+
 
 # Global metrics server instance
 _metrics_server: Optional[MetricsServer] = None
 
 
-async def start_metrics_server(port: int = 8000) -> None:
-    """Start the global metrics server."""
+async def start_metrics_server(port: int = 8000, raft_node=None) -> None:
+    """Start the global metrics server.
+
+    raft_node is optional and only used to answer /ready; passing it is what
+    makes the readiness probe meaningful rather than always-503.
+    """
     global _metrics_server
-    _metrics_server = MetricsServer(port)
+    _metrics_server = MetricsServer(port, raft_node=raft_node)
     await _metrics_server.start()
 
 
