@@ -1,0 +1,147 @@
+---
+# Headless Service: gives each pod an individually-resolvable DNS name
+# (raft-node-0.raft, raft-node-1.raft, ...). clusterIP: None is what makes
+# this headless; a normal Service would load-balance across pods, which is
+# useless for peer-to-peer consensus traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft
+  labels:
+    app: raft
+spec:
+  clusterIP: None
+  selector:
+    app: raft
+  ports:
+    - name: raft
+      port: 50051
+    - name: client
+      port: 51051
+    - name: metrics
+      port: 8001
+---
+# Regular ClusterIP Service: one stable address for clients (kvctl), so
+# callers don't have to pick a pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-client
+  labels:
+    app: raft
+spec:
+  selector:
+    app: raft
+  ports:
+    - name: client
+      port: 51051
+      targetPort: 51051
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: raft-config
+  labels:
+    app: raft
+data:
+  PEER_LIST: "raft-node-0:raft-node-0.raft:50051:51051,raft-node-1:raft-node-1.raft:50051:51051,raft-node-2:raft-node-2.raft:50051:51051,raft-node-3:raft-node-3.raft:50051:51051,raft-node-4:raft-node-4.raft:50051:51051"
+---
+# PodDisruptionBudget: this is where Raft's quorum requirement becomes a
+# deployment-level guarantee. minAvailable is the strict majority
+# (3 of 5), so Kubernetes will refuse a voluntary
+# disruption (rolling update, node drain) that would drop the cluster below
+# the number of nodes it needs to elect a leader and commit entries.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: raft-pdb
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: raft
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raft-node
+  labels:
+    app: raft
+spec:
+  serviceName: raft
+  replicas: 5
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: raft
+  template:
+    metadata:
+      labels:
+        app: raft
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: raft-node
+          image: raft-node:latest
+          # kind loads images into its nodes directly (kind load
+          # docker-image); Never stops kubelet trying to pull from a
+          # registry that doesn't have this image.
+          imagePullPolicy: Never
+          ports:
+            - name: raft
+              containerPort: 50051
+            - name: client
+              containerPort: 51051
+            - name: metrics
+              containerPort: 8001
+          env:
+            # Identity from the downward API: every pod shares this one pod
+            # template, so NODE_ID can't be hardcoded the way Compose does
+            # it. metadata.name is the stable pod name (raft-node-0, ...).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PEER_LIST
+              valueFrom:
+                configMapKeyRef:
+                  name: raft-config
+                  key: PEER_LIST
+            - name: RAFT_PORT
+              value: "50051"
+            - name: CLIENT_PORT
+              value: "51051"
+            - name: DATA_DIR
+              value: /app/data
+            - name: LOG_LEVEL
+              value: INFO
+          # Liveness: is the process alive. Unconditional OK - a node
+          # mid-election is alive and must NOT be restarted.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Readiness: should this pod receive traffic. 503 until the node
+          # settles into follower or leader.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8001
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+  # Per-pod persistent storage. This is the StatefulSet's other half of
+  # "stable identity": raft-node-2 restarting reattaches THIS volume and
+  # recovers its own log and term, rather than coming back empty.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

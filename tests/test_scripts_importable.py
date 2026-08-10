@@ -57,3 +57,72 @@ def test_chaos_tester_keys_nodes_by_id_not_address():
     assert DEFAULT_CLUSTER_NODES["node1"] == "localhost:51051"
     assert DEFAULT_CLUSTER_NODES["node15"] == "localhost:51065"
     assert len(DEFAULT_CLUSTER_NODES) == 15
+
+
+def test_gen_k8s_manifests_module_imports():
+    import scripts.gen_k8s_manifests as gen
+    assert hasattr(gen, "render")
+    assert hasattr(gen, "build_peer_list")
+    assert hasattr(gen, "quorum")
+
+
+def test_k8s_quorum_is_strict_majority():
+    """The PodDisruptionBudget's whole purpose is encoding this number - if
+    it's wrong, a rolling update can silently take the cluster below quorum."""
+    from scripts.gen_k8s_manifests import quorum
+    assert quorum(1) == 1
+    assert quorum(3) == 2
+    assert quorum(5) == 3
+    assert quorum(15) == 8
+
+
+def test_k8s_peer_list_uses_headless_dns_and_uniform_ports():
+    """Inverse of the Compose scheme: every pod shares the same ports and
+    differs by hostname, which only resolves via the headless Service."""
+    from scripts.gen_k8s_manifests import build_peer_list
+    peer_list = build_peer_list(3)
+
+    assert peer_list == (
+        "raft-node-0:raft-node-0.raft:50051:51051,"
+        "raft-node-1:raft-node-1.raft:50051:51051,"
+        "raft-node-2:raft-node-2.raft:50051:51051"
+    )
+
+
+def test_k8s_render_emits_all_five_manifests_and_correct_pdb():
+    import yaml
+    from scripts.gen_k8s_manifests import render
+
+    docs = [d for d in yaml.safe_load_all(render(5)) if d]
+    kinds = [d["kind"] for d in docs]
+
+    assert kinds.count("StatefulSet") == 1
+    assert kinds.count("Service") == 2          # headless + ClusterIP
+    assert kinds.count("PodDisruptionBudget") == 1
+    assert kinds.count("ConfigMap") == 1
+
+    pdb = next(d for d in docs if d["kind"] == "PodDisruptionBudget")
+    assert pdb["spec"]["minAvailable"] == 3     # quorum of 5
+
+    sts = next(d for d in docs if d["kind"] == "StatefulSet")
+    assert sts["spec"]["replicas"] == 5
+    assert sts["spec"]["serviceName"] == "raft"
+    # Identity must come from the downward API, not a hardcoded NODE_ID.
+    env_names = [e["name"] for e in sts["spec"]["template"]["spec"]["containers"][0]["env"]]
+    assert "POD_NAME" in env_names
+    # Each pod needs its own volume, not a shared one.
+    assert sts["spec"]["volumeClaimTemplates"][0]["metadata"]["name"] == "data"
+
+
+def test_k8s_probes_use_the_right_endpoints():
+    """Liveness on /health, readiness on /ready - swapping them would make
+    k8s restart pods mid-election instead of just withholding traffic."""
+    import yaml
+    from scripts.gen_k8s_manifests import render
+
+    docs = [d for d in yaml.safe_load_all(render(3)) if d]
+    sts = next(d for d in docs if d["kind"] == "StatefulSet")
+    container = sts["spec"]["template"]["spec"]["containers"][0]
+
+    assert container["livenessProbe"]["httpGet"]["path"] == "/health"
+    assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
