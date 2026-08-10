@@ -151,7 +151,7 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ## 🧪 Testing Coverage
 
-- **169 tests** covering:
+- **194 tests** covering:
   - Leader election scenarios
   - Log replication
   - Crash recovery
