@@ -52,10 +52,16 @@ def get_cluster_config() -> Dict[str, Any]:
     Returns:
         Dictionary with cluster configuration
     """
-    # Get node identity
-    node_id = os.getenv("NODE_ID")
+    # Get node identity. Docker Compose sets NODE_ID explicitly per service.
+    # A Kubernetes StatefulSet can't - all its pods share one pod template -
+    # so each pod supplies its own name via the downward API instead
+    # (metadata.name, e.g. "raft-node-0"), which is stable across restarts.
+    node_id = os.getenv("NODE_ID") or os.getenv("POD_NAME")
     if not node_id:
-        raise ValueError("NODE_ID environment variable is required")
+        raise ValueError(
+            "Node identity is required: set NODE_ID (Docker Compose) or "
+            "POD_NAME via the downward API (Kubernetes)"
+        )
     
     # Get peer list
     peer_list_str = os.getenv("PEER_LIST", "")
