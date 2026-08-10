@@ -11,6 +11,16 @@ metadata:
     app: raft
 spec:
   clusterIP: None
+  # Without this, only endpoints backed by READY pods get DNS records.
+  # Readiness here depends on Raft election state (see readinessProbe
+  # below), and node.py opens a fresh gRPC channel per RPC rather than
+  # holding long-lived connections - so if this were unset, a node stuck
+  # CANDIDATE past the readiness probe's failure window would drop out of
+  # its own peers' DNS, and could never receive the votes needed to become
+  # FOLLOWER/LEADER and regain readiness. Peer-to-peer discovery must be
+  # unconditional; only client traffic (raft-client Service, below) should
+  # stay readiness-gated.
+  publishNotReadyAddresses: true
   selector:
     app: raft
   ports:
@@ -47,10 +57,17 @@ data:
   PEER_LIST: "raft-node-0:raft-node-0.raft:50051:51051,raft-node-1:raft-node-1.raft:50051:51051,raft-node-2:raft-node-2.raft:50051:51051,raft-node-3:raft-node-3.raft:50051:51051,raft-node-4:raft-node-4.raft:50051:51051"
 ---
 # PodDisruptionBudget: this is where Raft's quorum requirement becomes a
-# deployment-level guarantee. minAvailable is the strict majority
+# deployment-level guarantee for EVICTIONS - node drain, cluster-autoscaler,
+# descheduler, manual `kubectl evict`. minAvailable is the strict majority
 # (3 of 5), so Kubernetes will refuse a voluntary
-# disruption (rolling update, node drain) that would drop the cluster below
-# the number of nodes it needs to elect a leader and commit entries.
+# eviction that would drop the cluster below the number of nodes it needs to
+# elect a leader and commit entries. Note this does NOT cover rolling
+# updates: the StatefulSet deletes pods directly via its own RollingUpdate
+# strategy, which never goes through the Eviction API the PDB guards. What
+# keeps a routine `kubectl rollout restart` safe is the StatefulSet's
+# default one-ordinal-at-a-time update behavior below, not this PDB - the
+# PDB is the backstop for the abnormal case (drain, bad rollout config
+# forcing extra parallelism), not the mechanism behind routine rollouts.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

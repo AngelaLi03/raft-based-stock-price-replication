@@ -2,11 +2,14 @@
 Raft types, enums, and constants.
 """
 
+import logging
 import os
 import re
 from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 class RaftState(Enum):
@@ -116,8 +119,22 @@ def resolve_metrics_port(node_id: str) -> int:
     must bind the same port. Falls back to the per-node port derived from
     node_id otherwise - the Docker Compose scheme, where each node already
     has its own unique port and no such env var is set.
+
+    Never raises: a malformed METRICS_PORT (non-integer) logs a warning and
+    falls through to the per-node computation instead of propagating
+    ValueError, matching the "never raises" guarantee metrics_port_for_node_id
+    already documents. Without this, a bad env var would crash RaftNode.__init__
+    outright (the call site in raft/node.py only catches ImportError) -
+    the same "loud failure from an unexpected place" shape as the node-ID
+    parsing bug, just for a different malformed input.
     """
     override = os.environ.get("METRICS_PORT")
     if override:
-        return int(override)
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning(
+                "Ignoring malformed METRICS_PORT=%r; falling back to "
+                "per-node computation for node_id=%r", override, node_id
+            )
     return metrics_port_for_node_id(node_id)

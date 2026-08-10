@@ -61,3 +61,15 @@ def test_metrics_port_falls_back_to_per_node_id_when_env_unset(monkeypatch):
     monkeypatch.delenv("METRICS_PORT", raising=False)
     assert resolve_metrics_port("node1") == metrics_port_for_node_id("node1")
     assert resolve_metrics_port("raft-node-3") == metrics_port_for_node_id("raft-node-3")
+
+
+def test_malformed_metrics_port_falls_back_instead_of_raising(monkeypatch):
+    """A malformed METRICS_PORT must not raise ValueError out of
+    resolve_metrics_port. At the raft/node.py call site this sits inside a
+    try/except that only catches ImportError, so an uncaught ValueError here
+    would crash RaftNode.__init__ outright - CrashLoopBackOff under
+    Kubernetes. metrics_port_for_node_id() is documented as never raising;
+    resolve_metrics_port() must keep that guarantee."""
+    monkeypatch.setenv("METRICS_PORT", "not-a-port")
+    assert resolve_metrics_port("raft-node-2") == metrics_port_for_node_id("raft-node-2")
+    assert resolve_metrics_port("node9") == metrics_port_for_node_id("node9")

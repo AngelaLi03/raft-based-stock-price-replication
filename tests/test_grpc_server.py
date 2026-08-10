@@ -12,9 +12,9 @@ opposed to the always-zero, never-updated old collector) - only a live
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from server.grpc_server import ClientService
+from server.grpc_server import ClientService, GrpcServer
 from client.proto import client_pb2
 
 
@@ -98,3 +98,39 @@ async def test_dump_state_with_no_metrics(mock_context):
 
     assert response.ok is True
     assert response.node_id == "node1"
+
+
+@pytest.mark.asyncio
+async def test_start_wires_raft_node_into_metrics_server():
+    """Regression test for the wiring that makes /ready meaningful at all.
+
+    GrpcServer.start() calls start_metrics_server(port, raft_node=self.raft_node).
+    Nothing else asserts this kwarg is actually passed through - if it were
+    accidentally dropped, MetricsServer would have no RaftNode to read state
+    from and /ready would presumably 503 (or error) forever on every pod,
+    the exact worst-case failure this whole feature exists to avoid, while
+    the rest of the test suite (which only exercises MetricsServer.handle_ready
+    directly with a manually-constructed instance) would keep passing.
+    """
+    raft_node = MagicMock()
+    raft_node.node_id = "raft-node-0"
+
+    server = GrpcServer(raft_node, raft_port=50051, client_port=51051)
+
+    # resolve_metrics_port and start_metrics_server are imported locally
+    # inside GrpcServer.start(), so they must be patched at their source
+    # modules (`from X import Y` re-resolves Y from X's namespace at call
+    # time) rather than as attributes of server.grpc_server.
+    with patch("raft.types.resolve_metrics_port", return_value=8000), \
+         patch("server.metrics_server.start_metrics_server", new=AsyncMock()) as mock_start:
+        # Avoid actually binding real gRPC servers/ports.
+        with patch("server.grpc_server.grpc.aio.server") as mock_grpc_server:
+            fake_server = MagicMock()
+            fake_server.start = AsyncMock()
+            mock_grpc_server.return_value = fake_server
+
+            await server.start()
+
+    mock_start.assert_awaited_once()
+    _, kwargs = mock_start.call_args
+    assert kwargs["raft_node"] is raft_node

@@ -286,10 +286,12 @@ for i in 0 1 2 3 4; do
   echo "raft-node-$i: $(kubectl exec raft-node-$i -- python3 scripts/kvctl.py cluster-info --host localhost --port 51051 2>&1 | grep Role)"
 done
 
-kubectl exec raft-node-1 -- python3 scripts/kvctl.py put-price K8S 42.0 --host localhost --port 51051
+kubectl exec <LEADER_POD> -- python3 scripts/kvctl.py put-price K8S 42.0 --host localhost --port 51051
 kubectl exec raft-node-0 -- python3 scripts/kvctl.py get-price K8S --host localhost --port 51051
 # K8S: $42.0 — read back correctly from a different pod, over pod DNS
 ```
+
+Replace `<LEADER_POD>` with whichever pod the previous step's `cluster-info` output showed as `Role: leader` — leader election is non-deterministic, so it won't reliably be `raft-node-1` or any other fixed ordinal.
 
 ### 5. The PodDisruptionBudget is quorum, enforced by the deployment layer
 
@@ -315,6 +317,12 @@ kind delete cluster --name raft
 ### A note on election timing under kind
 
 `ELECTION_TIMEOUT_MIN/MAX` (150/300ms) and `HEARTBEAT_INTERVAL` (75ms) are tuned for same-host Compose networking. kind adds an extra network hop even on a single machine, so heartbeat round-trips occasionally run long enough to trigger more frequent re-elections than under Compose. This didn't break correctness in any verification pass (writes, reads, replication, and PVC/identity reattachment across a pod restart all held up) — it's a pre-existing timing-constant characteristic, not something this migration introduced or fixed, worth knowing if a live kind cluster shows more leader churn than you'd expect from watching Compose.
+
+### A note on what wasn't exercised here
+
+The `raft-client` ClusterIP Service exists so reads and cluster-info calls have one stable, load-balanced address (e.g. via `kubectl port-forward svc/raft-client <port>:51051`) instead of callers having to pick a pod — but every command above goes through `kubectl exec` directly into a specific pod on `localhost:51051`, not through that Service. It wasn't live-tested in this branch. It's also not a safe place to route writes through: see Known Issue #1 above (`leader_hint` is never populated), so a write landing on a non-leader pod via this Service just fails with no way for the client to recover.
+
+Separately, the existing Grafana/Prometheus stack (`ops/monitoring/`) scrapes the Docker Compose service names (`node1`..`node15`) and does not currently scrape the Kubernetes pods exposed here, even though the same `/metrics` endpoint is served on each pod's `METRICS_PORT`. Wiring monitoring up for the Kubernetes path is future work, not something this migration claims to do.
 
 ## Monitoring & Alerting
 
