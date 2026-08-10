@@ -111,6 +111,8 @@ spec:
               value: "50051"
             - name: CLIENT_PORT
               value: "51051"
+            - name: METRICS_PORT
+              value: "8001"
             - name: DATA_DIR
               value: /app/data
             - name: LOG_LEVEL

@@ -162,6 +162,8 @@ spec:
               value: "{RAFT_PORT}"
             - name: CLIENT_PORT
               value: "{CLIENT_PORT}"
+            - name: METRICS_PORT
+              value: "{METRICS_PORT}"
             - name: DATA_DIR
               value: /app/data
             - name: LOG_LEVEL

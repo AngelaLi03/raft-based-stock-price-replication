@@ -11,7 +11,7 @@ Exception) - which would have left readiness probes unanswered forever.
 
 import pytest
 
-from raft.types import metrics_port_for_node_id
+from raft.types import metrics_port_for_node_id, resolve_metrics_port
 
 
 @pytest.mark.parametrize("node_id,expected", [
@@ -42,3 +42,22 @@ def test_id_with_no_trailing_number_falls_back_instead_of_raising():
 
 def test_base_is_configurable():
     assert metrics_port_for_node_id("node3", base=9000) == 9003
+
+
+def test_metrics_port_env_override_wins_regardless_of_node_id(monkeypatch):
+    """This is what the Kubernetes manifests rely on: every pod shares one
+    pod template and therefore must bind the same metrics port, so an
+    explicit METRICS_PORT env var must override the per-node computation
+    no matter what node_id says."""
+    monkeypatch.setenv("METRICS_PORT", "8001")
+    assert resolve_metrics_port("raft-node-0") == 8001
+    assert resolve_metrics_port("raft-node-4") == 8001
+    assert resolve_metrics_port("node9") == 8001
+
+
+def test_metrics_port_falls_back_to_per_node_id_when_env_unset(monkeypatch):
+    """Docker Compose sets no METRICS_PORT, so this must be a no-op change
+    for Compose - the existing per-node computation still applies."""
+    monkeypatch.delenv("METRICS_PORT", raising=False)
+    assert resolve_metrics_port("node1") == metrics_port_for_node_id("node1")
+    assert resolve_metrics_port("raft-node-3") == metrics_port_for_node_id("raft-node-3")

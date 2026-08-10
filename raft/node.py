@@ -52,9 +52,8 @@ class RaftNode:
         # Initialize metrics
         try:
             from raft.prometheus_metrics import init_prometheus_metrics
-            from .types import metrics_port_for_node_id
-            # Use different ports for each node to avoid conflicts
-            metrics_port = metrics_port_for_node_id(node_id)
+            from .types import resolve_metrics_port
+            metrics_port = resolve_metrics_port(node_id)
             init_prometheus_metrics(node_id, metrics_port)
         except ImportError:
             logger.warning("Prometheus metrics not available")

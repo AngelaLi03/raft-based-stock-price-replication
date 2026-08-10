@@ -2,6 +2,7 @@
 Raft types, enums, and constants.
 """
 
+import os
 import re
 from enum import Enum
 from dataclasses import dataclass
@@ -105,3 +106,18 @@ def metrics_port_for_node_id(node_id: str, base: int = 8000) -> int:
     """
     match = re.search(r'(\d+)$', node_id)
     return base + (int(match.group(1)) if match else 1)
+
+
+def resolve_metrics_port(node_id: str) -> int:
+    """Resolve this node's metrics port.
+
+    An explicit METRICS_PORT env var wins - this is what the Kubernetes
+    manifests set, since every pod shares one pod template and therefore
+    must bind the same port. Falls back to the per-node port derived from
+    node_id otherwise - the Docker Compose scheme, where each node already
+    has its own unique port and no such env var is set.
+    """
+    override = os.environ.get("METRICS_PORT")
+    if override:
+        return int(override)
+    return metrics_port_for_node_id(node_id)

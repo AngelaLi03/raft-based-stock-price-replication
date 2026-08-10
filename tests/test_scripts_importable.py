@@ -108,8 +108,14 @@ def test_k8s_render_emits_all_five_manifests_and_correct_pdb():
     assert sts["spec"]["replicas"] == 5
     assert sts["spec"]["serviceName"] == "raft"
     # Identity must come from the downward API, not a hardcoded NODE_ID.
-    env_names = [e["name"] for e in sts["spec"]["template"]["spec"]["containers"][0]["env"]]
+    env = sts["spec"]["template"]["spec"]["containers"][0]["env"]
+    env_names = [e["name"] for e in env]
     assert "POD_NAME" in env_names
+    # Every pod shares the same pod template and therefore must bind the
+    # same metrics port explicitly - the server otherwise derives a
+    # per-node port from node_id, which would only be correct for one pod.
+    metrics_port_entry = next(e for e in env if e["name"] == "METRICS_PORT")
+    assert metrics_port_entry["value"] == "8001"
     # Each pod needs its own volume, not a shared one.
     assert sts["spec"]["volumeClaimTemplates"][0]["metadata"]["name"] == "data"
 
