@@ -13,7 +13,7 @@ Raft is the algorithm behind the consistency guarantees of systems like etcd (Ku
 - **Protocol Buffers** for wire format / service definitions (`proto/raft.proto`, `proto/client.proto`)
 - **Docker Compose** for local cluster orchestration (15-node by default, generated — see `scripts/gen_docker_compose.py`)
 - **Prometheus client** for metrics export (added in the in-progress Week 4 work)
-- **pytest** + `pytest-asyncio` for the test suite (169 tests, ~4,300 lines across 16 files)
+- **pytest** + `pytest-asyncio` for the test suite (194 tests, across 18 files)
 
 ## Concurrency Model
 
@@ -115,6 +115,8 @@ Node count is generated, not hand-maintained — see `scripts/gen_docker_compose
     - **A write could be acked `ok=True` and then still vanish.** `_flush_pending_entries()` computed success from `_replicate_to_peers()`'s majority-ACK count alone, but `_update_commit_index()` — the only thing that actually advances `commit_index` — silently no-ops once `self.state != RaftState.LEADER`. If this node stepped down between `_replicate_to_peers()` returning and the success check (real election timing, not contrived), the entry was majority-replicated on peers' raw logs but never actually committed, and the client was still told `ok=True` — data that the next elected leader can then freely overwrite via normal log-matching. Live-observed: a leader reported `ok=True` for two writes that were then missing from *every* node, including itself. Fixed by checking `state == LEADER` after `_update_commit_index()` before reporting success; if leadership was lost, the batch is truncated and the futures resolve `False`, same as the existing replication-failure path.
     - **Status: partially live-verified.** All three have fast, deterministic regression tests that reproduce the exact failure and prove the fix (169 tests total). The first two were also confirmed live: post-fix runs showed no more stuck candidates and term counts staying low and stable instead of climbing into the hundreds. The third has strong unit-test evidence but wasn't independently reconfirmed via a full clean `chaos_test.py` run — see Known Issue #6 below, which is what cut that verification pass short.
 18. **`scripts/gen_protos.sh` used `sed -i ''` — BSD/macOS-only syntax, silently broken on every Linux machine**: GNU sed (Linux, including every GitHub Actions runner) parses the empty string after `-i` as the sed *script* itself and the real script argument as a *filename* — it doesn't error, it just does the wrong thing or fails confusingly. This had been broken since the script was first written; invisible for the project's entire life because all prior development and testing happened on macOS. Found by the very first live CI run on `ubuntu-latest` (see "Continuous Integration" below), which failed at the "Regenerate protobuf stubs" step within minutes of the workflow existing — exactly the kind of bug this feature exists to catch. Fixed by dropping `-i` entirely in favor of `sed '...' file > file.tmp && mv file.tmp file`, which is standard POSIX behavior identical on both BSD and GNU sed — not a Linux-specific workaround that would have traded one platform's breakage for the other's.
+19. **Node-ID parsing assumed the Compose naming scheme (`nodeN`), and broke two different ways once Kubernetes StatefulSet-style IDs (`raft-node-0`) existed** — found while adapting the codebase for Kubernetes, before any k8s manifest existed. Two call sites computed the metrics port the same way — `8000 + int(node_id.replace('node', ''))` — and both broke on `raft-node-0` (`.replace('node', '')` only strips the literal substring, leaving `"raft--0"`, and `int("raft--0")` raises `ValueError`) — but with two genuinely different failure modes, because of what each caught. `raft/node.py`'s metrics-init block only caught `ImportError`, so the `ValueError` propagated uncaught and crashed `RaftNode.__init__` outright — loud, but unambiguous. `server/grpc_server.py`'s metrics-server startup caught a broad `except Exception`, so it swallowed the same `ValueError`, logged a warning, and moved on as if nothing had happened — except that server is also what serves `/ready`, so under Kubernetes the pod would sit un-Ready forever, with nothing in its status (no crash, no restart) pointing at why. The silent one was strictly worse: a crash is at least visible. Fixed with `metrics_port_for_node_id()` (`raft/types.py`), which derives the port from the node ID's trailing digits via regex instead of assuming a literal `"node"` prefix to strip — works identically for `node1`..`node15` and `raft-node-0`..`raft-node-4`.
+20. **The Kubernetes manifest generator hardcoded a metrics port that contradicted the function it was supposed to agree with** — a real gap in this migration's own plan, not an implementation mistake, caught by static code review of the manifest generator's output before any live cluster existed (not by the live testing above). `scripts/gen_k8s_manifests.py` hardcoded `METRICS_PORT = 8001` uniformly across every pod's `containerPort` and both probes, but (per #19 above) the process itself derives its real bound port per-node via `metrics_port_for_node_id()` — under k8s that's `8000 + <pod ordinal>`, so only `raft-node-1` would actually have been listening on the port its own probes pointed at; the other four pods' `/health` and `/ready` probes would have targeted a port nothing was bound to, forever failing readiness and eventually restart-looping on failed liveness checks. Fixed with `resolve_metrics_port()` (`raft/types.py`), which checks a `METRICS_PORT` env var first and only falls back to the per-node computation if it's unset; the generated manifest now sets `METRICS_PORT` explicitly in each pod's env, so every pod's bound port and its own probes agree — uniformly, by explicit design, since k8s pods (unlike Compose containers sharing one host) don't need unique ports to avoid colliding with each other in the first place. Docker Compose is untouched: it never sets `METRICS_PORT`, so `resolve_metrics_port()` always falls through to the same per-node value it already computed.
 
 ### Known issues still open
 1. **No leader-hint on redirect**: `put_price()`/`batch_put_price()` never set `leader_hint` when returning "not leader" (`node.py`, a no-op `# TODO` loop) — clients can't be automatically redirected to the current leader.
@@ -158,7 +160,7 @@ bash scripts/gen_protos.sh
 PYTHONPATH=. pytest tests/ -v
 ```
 
-169 tests, ~8s, all passing as of this writing. Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
+194 tests, ~8s, all passing as of this writing (verified via `PYTHONPATH=. .venv311/bin/python3 -m pytest tests/ --collect-only -q`). Run a single file with `pytest tests/test_election.py -v`, or `-k <pattern>` to filter by name.
 
 ## Continuous Integration
 
@@ -243,6 +245,77 @@ PYTHONPATH=. python3 scripts/kvctl.py dump-state --host localhost --port <new_le
 PYTHONPATH=. python3 scripts/kvctl.py get-price NVDA --host localhost --port 51065
 ```
 
+## Running on Kubernetes
+
+The same cluster also runs as a Kubernetes StatefulSet — locally verified against [kind](https://kind.sigs.k8s.io/) (Kubernetes-in-Docker), 5 nodes by default. This isn't a parallel implementation: it's the identical `raft-node:latest` image and the same `RaftNode`/`GrpcServer` code, deployed a different way — see `scripts/gen_k8s_manifests.py`.
+
+### 1. Install kind and create a cluster
+
+```bash
+brew install kind
+kind create cluster --name raft
+kubectl config current-context   # kind-raft
+kubectl get nodes                # raft-control-plane, Ready
+```
+
+### 2. Build the image and load it into kind
+
+```bash
+docker build -f ops/Dockerfile -t raft-node:latest .
+kind load docker-image raft-node:latest --name raft
+```
+
+This load step is required, not optional: a kind node is itself a container, isolated from the host Docker daemon that just built the image — kubelet inside it can't see that image at all. The manifest sets `imagePullPolicy: Never` (deliberately — there's no registry to pull from in local dev), so skipping `kind load` doesn't fall back to anything; every pod sits in `ErrImageNeverPull` until the image has actually been loaded into the kind node directly.
+
+### 3. Generate and apply the manifests
+
+```bash
+python3 scripts/gen_k8s_manifests.py --nodes 5 > ops/k8s/raft-cluster.yaml
+kubectl apply -f ops/k8s/raft-cluster.yaml
+kubectl wait --for=condition=Ready pod -l app=raft --all --timeout=180s
+kubectl get pods -o wide   # raft-node-0 .. raft-node-4, 1/1 Running
+```
+
+N=5 is the local default; Compose's default is 15 (`scripts/gen_docker_compose.py --nodes 15`, see "Running the Cluster" above). Quorum for 5 nodes is 3 (`(5 // 2) + 1`) — that's also the `PodDisruptionBudget`'s `minAvailable`, see below.
+
+### 4. Verify leader election and replication
+
+```bash
+# check a few pods for whichever one says "Role: leader"
+for i in 0 1 2 3 4; do
+  echo "raft-node-$i: $(kubectl exec raft-node-$i -- python3 scripts/kvctl.py cluster-info --host localhost --port 51051 2>&1 | grep Role)"
+done
+
+kubectl exec raft-node-1 -- python3 scripts/kvctl.py put-price K8S 42.0 --host localhost --port 51051
+kubectl exec raft-node-0 -- python3 scripts/kvctl.py get-price K8S --host localhost --port 51051
+# K8S: $42.0 — read back correctly from a different pod, over pod DNS
+```
+
+### 5. The PodDisruptionBudget is quorum, enforced by the deployment layer
+
+`raft-pdb`'s `minAvailable` is generated as `quorum(N)` — the same majority formula Raft itself uses — `minAvailable: 3` for the 5-node default. Evicting pods one at a time against a live cluster (`kubectl create --raw /api/v1/namespaces/default/pods/<name>/eviction -f <eviction.json>` — needed here because of a `kubectl` client/server version skew; `kubectl create -f` with `kind: Eviction` didn't route to the eviction subresource), the third eviction — which would have dropped healthy pods to 2, below the floor of 3 — was refused directly by the API server, before it ever reached the application:
+
+```
+Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's disruption budget.
+```
+
+A `kubectl rollout restart statefulset/raft-node` (the routine way to roll out a new image) never dropped the ready-pod count below 4 of 5 during a full restart — the default StatefulSet rolling-update strategy updates one ordinal at a time, in reverse order, and waits for readiness before moving to the next, comfortably clear of the PDB's floor of 3. See `learn.md` Part 11 for why this is the deployment layer expressing Raft's own quorum rule, not a separate, coincidentally-similar number.
+
+### Tearing down
+
+```bash
+kubectl delete -f ops/k8s/raft-cluster.yaml
+kubectl delete pvc -l app=raft   # StatefulSet PVCs deliberately outlive their pods -
+                                  # deleting the manifests does NOT delete the
+                                  # data-raft-node-* volumes. Same class of gotcha as
+                                  # `docker compose down` without `-v` above.
+kind delete cluster --name raft
+```
+
+### A note on election timing under kind
+
+`ELECTION_TIMEOUT_MIN/MAX` (150/300ms) and `HEARTBEAT_INTERVAL` (75ms) are tuned for same-host Compose networking. kind adds an extra network hop even on a single machine, so heartbeat round-trips occasionally run long enough to trigger more frequent re-elections than under Compose. This didn't break correctness in any verification pass (writes, reads, replication, and PVC/identity reattachment across a pod restart all held up) — it's a pre-existing timing-constant characteristic, not something this migration introduced or fixed, worth knowing if a live kind cluster shows more leader churn than you'd expect from watching Compose.
+
 ## Monitoring & Alerting
 
 Prometheus + Grafana run as a separate compose stack (`ops/docker-compose.monitoring.yml`) on top of the cluster's existing per-node metrics, joining the cluster's `raft-network` so Prometheus can scrape all 15 nodes by service name. Everything — datasource, dashboard, alert rules — is provisioned as code under `ops/monitoring/`, not clicked together manually.
@@ -306,13 +379,15 @@ Tear down with `cd ops && docker compose -f docker-compose.monitoring.yml down -
 │   ├── kvctl.py                # CLI tool (cluster-info, put-price, batch-put-price, get-price, dump-state)
 │   ├── gen_protos.sh           # Protobuf codegen
 │   ├── gen_docker_compose.py   # Generates ops/docker-compose.yml for N nodes
+│   ├── gen_k8s_manifests.py    # Generates ops/k8s/raft-cluster.yaml for N nodes
 │   ├── benchmark.py            # Load benchmark (import + mixed-workload race fixed, live verification partial)
 │   ├── chaos_test.py           # Container-level chaos scenarios (node-targeting fixed, full-run verification partial)
 │   └── dashboard_demo.py       # Narrated live demo of the monitoring stack (failover, quorum loss, flapping)
-├── tests/                      # 15 files, ~4,100 lines, 157 tests, all passing
+├── tests/                      # 18 files, 194 tests, all passing
 ├── ops/                        # docker-compose.yml (generated, 15 nodes), Dockerfile
 │   ├── docker-compose.monitoring.yml  # Prometheus + Grafana, joins raft-network
 │   └── monitoring/             # Prometheus scrape config, Grafana datasource/dashboard/alert provisioning
+├── ops/k8s/                    # Generated Kubernetes manifests (StatefulSet, Services, PDB, ConfigMap)
 ├── ruff.toml                   # Lint rule set (E4/E7/E9/F), excludes generated protobuf files
 └── README.md
 ```
@@ -348,7 +423,7 @@ See "Local Development Setup" and "Running the Test Suite" / "Running the Cluste
 ## Future Roadmap (not started)
 
 - **Live Data Integration**: real-time price ingestion (`ingestor/feeder.py`), external API integration (Yahoo Finance / Alpha Vantage), automatic leader discovery/redirect, batch ingestion
-- **Visualization & Deployment**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status, CI/CD
+- **Visualization**: FastAPI + Chart.js dashboard showing live price charts and cluster/leader-election status
 
 ## Additional Resources
 

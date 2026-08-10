@@ -91,6 +91,15 @@ Client → gRPC → ClientService → RaftNode.get_price()
 - **Key gotcha**: `count(x == 2)` returns *no data* (not 0) on zero matches — used `sum(x == bool 2)` instead so the no-leader alert can actually fire on the case it exists for
 - **`scripts/dashboard_demo.py`**: narrated live demo — failover, quorum loss, flapping — watchable on the dashboard in real time
 
+## ☸️ Kubernetes Deployment
+
+- **Generated** by `scripts/gen_k8s_manifests.py --nodes 5 > ops/k8s/raft-cluster.yaml` (mirrors `gen_docker_compose.py`) — 5 manifests: headless Service (`raft`, per-pod DNS), ClusterIP Service (`raft-client`), ConfigMap (`PEER_LIST`), PodDisruptionBudget (`raft-pdb`), StatefulSet (`raft-node`)
+- **Key commands**: `kind create cluster --name raft` → `docker build -f ops/Dockerfile -t raft-node:latest .` → `kind load docker-image raft-node:latest --name raft` (required — kind nodes can't see the host Docker daemon; `imagePullPolicy: Never` means skipping this = `ErrImageNeverPull`) → `kubectl apply -f ops/k8s/raft-cluster.yaml`
+- **Quorum/PDB relationship**: `minAvailable` is generated as `quorum(N)` — the same `(N//2)+1` formula Raft's own commit logic uses. For 5 nodes: `minAvailable: 3`. Live-verified: a 3rd back-to-back pod eviction was refused — `Cannot evict pod as it would violate the pod's disruption budget` — and a full rolling restart never dropped ready pods below 4/5
+- **StatefulSet, not Deployment**: pods need stable ordinal names (`raft-node-0`..`raft-node-4`) and per-pod PVCs (`volumeClaimTemplates`) that a restarted pod reattaches — verified live, a deleted pod came back with the same name and its prior term/log/KV data intact
+- **Identity via downward API**: `POD_NAME` comes from `fieldRef: metadata.name`, not hardcoded — one pod template is shared by all N pods, unlike Compose's N separate service blocks
+- **N=5 local default** (Compose defaults to 15)
+
 ## 🌪️ Chaos-Testing Bugs Found (Live 15-Node Cluster)
 
 - **No RPC had a `timeout=`** → a peer accepting-but-not-responding (mid-restart) hung the caller forever → since election/heartbeat loops `gather()` every peer's RPC before proceeding, one stuck peer froze the *entire* loop, not just that peer. A candidate stuck 6+ minutes; a leader's heartbeat loop went silent mid-term. Fixed: `RPC_TIMEOUT_SECONDS = 2.0` on every outbound RPC, client and server.
@@ -114,6 +123,9 @@ Client → gRPC → ClientService → RaftNode.get_price()
 
 ### "How do you monitor it?"
 **Answer**: "Grafana + Prometheus, provisioned as code. Found a real bug testing the alerting itself: `count(role==2)` returns no data (not 0) when no leader exists, which Grafana treats as a separate non-firing state — fixed with `sum(role == bool 2)` so it always returns a real number. I don't trust an alert until I've actually stopped a node and watched it fire and resolve."
+
+### "How do you deploy a consensus system without downtime?"
+**Answer**: "The deployment layer has to know the same quorum math the algorithm does. My PodDisruptionBudget's `minAvailable` is generated as `quorum(N)` — same formula Raft uses to commit — so a rolling update or node drain can never be allowed to drop below majority. Live-verified: a 3rd eviction was refused by the API server directly, and a full rolling restart never dropped ready pods below 4 of 5."
 
 ### "What's a bug unit tests couldn't have caught?"
 **Answer**: "None of my gRPC calls had a timeout, so a container mid-restart — TCP connected, not yet responding — hung the caller forever instead of erroring, and since my election/heartbeat loops wait on every peer via `gather()`, one stuck peer froze the whole loop. Fixed with a 2-second RPC deadline everywhere. A mock can't reproduce that failure mode — it either returns or raises — so this only showed up running `chaos_test.py` against real Docker containers."
